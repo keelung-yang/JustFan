@@ -525,7 +525,10 @@ class MainWindow(QMainWindow):
 		self._stop_capture()
 		error = ""
 		try:
-			devices = query_input_devices()
+			devices = sorted(
+				query_input_devices(),
+				key=lambda device: (device.name.casefold(), device.host_api.casefold(), device.index),
+			)
 			default_index = int(sd.default.device[0])
 		except (sd.PortAudioError, OSError) as exception:
 			devices = []

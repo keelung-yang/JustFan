@@ -195,11 +195,30 @@ class InterfaceTests(unittest.TestCase):
         assert settings is not None
         self.assertEqual(len(self.window.spectra.curves[0].getData()[0]), settings.block_size // 2 + 1)
 
+    def test_device_sorting_preserves_default_and_refresh_selection(self) -> None:
+        devices = [
+            justfan.InputDevice(12, "USB microphone", "Windows WASAPI", 2, 48000, 0.01),
+            justfan.InputDevice(9, "alpha microphone", "Windows WASAPI", 1, 44100, 0.02),
+            self.devices[0],
+            justfan.InputDevice(6, "Alpha microphone", "ALSA", 1, 44100, 0.02),
+            justfan.InputDevice(11, "USB microphone", "MME", 2, 48000, 0.01),
+        ]
+        self.query.return_value = devices
+        self.window.refresh_devices()
+        combo = self.window.device_combo
+        self.assertEqual([combo.itemData(row).index for row in range(combo.count())], [6, 9, 3, 11, 12])
+        self.assertEqual(combo.currentData().index, 3)
+        self.assertEqual(self.check.call_args.kwargs["device"], 3)
+        combo.setCurrentIndex(combo.findText(devices[0].label))
+        self.window.refresh_devices()
+        self.assertEqual(combo.currentData().index, 12)
+        self.assertEqual(self.check.call_args.kwargs["device"], 12)
+
     def test_device_switch_clears_readings_and_queries_parameters(self) -> None:
         self.push()
         previous = self.window.capture.stream
         assert previous is not None
-        self.window.device_combo.setCurrentIndex(1)
+        self.window.device_combo.setCurrentIndex(self.window.device_combo.findText(self.devices[1].label))
         self.assertTrue(previous.closed)
         self.assertEqual(len(self.window.channel_widgets), 1)
         self.assertEqual(len(self.window.spectra.curves), 1)

@@ -46,8 +46,10 @@ runtime library for your distribution. Do not run the application as root.
 
 JustFan selects the default input device and starts capture on launch. The input
 selector includes each device's host API so that identically named devices can be
-distinguished. Select another microphone or sound card to stop the previous
-stream, clear its measurements, and rebuild the channel list and spectra.
+distinguished. Devices are sorted by name, then by host API, ignoring case.
+Sorting preserves the default device and the current selection when refreshing.
+Select another microphone or sound card to stop the previous stream, clear its
+measurements, and rebuild the channel list and spectra.
 
 The reported default sample rate, maximum input channel count, and low input
 latency fill the capture controls automatically. The block/FFT size is chosen
