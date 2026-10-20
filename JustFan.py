@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
 import pyqtgraph as pg
 
 
+VERSION = "1.0"
 DB_FLOOR = -120.0
 FFT_SIZES = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
 CHANNEL_COLORS = ("#087f8c", "#c75b39", "#5364ab", "#ac4271", "#56842e", "#a87516")
@@ -402,7 +403,7 @@ class MainWindow(QMainWindow):
 		self._last_warning = ""
 		self._fps_frames = 0
 		self._fps_started = perf_counter()
-		self.setWindowTitle("JustFan")
+		self.setWindowTitle(f"JustFan v{VERSION}")
 		self.resize(1360, 820)
 		self.setMinimumSize(860, 560)
 		self._build_ui()

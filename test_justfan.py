@@ -273,7 +273,7 @@ class InterfaceTests(unittest.TestCase):
         assert controls is not None
         control_layout = controls.layout()
         assert control_layout is not None
-        self.assertEqual(self.window.windowTitle(), "JustFan")
+        self.assertEqual(self.window.windowTitle(), "JustFan v1.0")
         self.assertFalse(any(label.text() == "JustFan" for label in controls.findChildren(QLabel)))
         self.assertEqual(control_layout.count(), 2)
         parameters = control_layout.itemAt(1).layout()
