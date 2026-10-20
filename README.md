@@ -79,6 +79,11 @@ reflow into columns as space permits and scroll vertically for larger channel
 counts. The left side shows three measurement rows per channel, with current
 values aligned left and measurement peaks aligned right.
 
+The bottom-right status bar shows **FPS** before the measured time. FPS counts
+display updates with new audio data, averaged over one second, rather than timer
+ticks or audio samples. It returns to zero when capture stops or no new frames
+are displayed.
+
 - **Noise (dBFS):** RMS amplitude over the most recent capture block. Peak is the
 	highest block RMS level since capture started or peaks were reset, not the
 	highest individual sample. Peaks are accumulated for every captured block,

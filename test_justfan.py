@@ -233,6 +233,41 @@ class InterfaceTests(unittest.TestCase):
         stream.callback(np.full((settings.block_size, settings.channels), amplitude), settings.block_size, None, "")
         self.window._update_measurement()
 
+    def test_fps_counts_only_new_display_frames_and_handles_no_new_audio(self) -> None:
+        self.assertLess(self.window.fps_label.x(), self.window.elapsed_label.x())
+        self.assertLessEqual(self.window.fps_label.geometry().right(), self.window.elapsed_label.x())
+        with patch.object(justfan, "perf_counter", return_value=100.0) as clock:
+            self.window.start_capture()
+            clock.return_value = 100.25
+            self.push()
+            self.window._update_measurement()
+            clock.return_value = 100.5
+            self.push()
+            clock.return_value = 101.0
+            self.window._update_measurement()
+            self.assertEqual(self.window.fps_label.text(), "FPS 2.0")
+            clock.return_value = 102.0
+            self.window._update_measurement()
+            self.assertEqual(self.window.fps_label.text(), "FPS 0.0")
+
+    def test_fps_resets_on_stop_restart_and_missing_device(self) -> None:
+        with patch.object(justfan, "perf_counter", return_value=100.0) as clock:
+            self.window.start_capture()
+            clock.return_value = 101.0
+            self.push()
+            self.assertEqual(self.window.fps_label.text(), "FPS 1.0")
+            self.window._toggle_capture()
+            self.assertEqual(self.window.fps_label.text(), "FPS 0.0")
+            clock.return_value = 102.0
+            self.window._toggle_capture()
+            self.assertEqual(self.window.fps_label.text(), "FPS 0.0")
+            clock.return_value = 103.0
+            self.push()
+            self.assertEqual(self.window.fps_label.text(), "FPS 1.0")
+            self.query.return_value = []
+            self.window.refresh_devices()
+            self.assertEqual(self.window.fps_label.text(), "FPS 0.0")
+
     def test_compact_controls_remove_duplicate_title_and_reuse_parameter_row(self) -> None:
         controls = self.window.findChild(QWidget, "controls")
         assert controls is not None

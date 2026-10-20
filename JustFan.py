@@ -5,6 +5,7 @@ import math
 import sys
 from dataclasses import dataclass
 from threading import Lock
+from time import perf_counter
 from urllib.parse import quote
 
 import numpy as np
@@ -399,6 +400,8 @@ class MainWindow(QMainWindow):
 		self.channel_widgets: list[ChannelWidget] = []
 		self._last_frames = -1
 		self._last_warning = ""
+		self._fps_frames = 0
+		self._fps_started = perf_counter()
 		self.setWindowTitle("JustFan")
 		self.resize(1360, 820)
 		self.setMinimumSize(860, 560)
@@ -544,8 +547,13 @@ class MainWindow(QMainWindow):
 		self.splitter.setSizes([350, 1000])
 		layout.addWidget(self.splitter, 1)
 		self.state_label = QLabel("Idle")
+		self.fps_label = QLabel("FPS 0.0")
+		self.fps_label.setMinimumWidth(self.fps_label.fontMetrics().horizontalAdvance("FPS 999.9") + 4)
+		self.fps_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+		self.fps_label.setToolTip("New audio display updates per second, averaged over one second.")
 		self.elapsed_label = QLabel("Measured 00:00:00")
 		self.statusBar().addWidget(self.state_label)
+		self.statusBar().addPermanentWidget(self.fps_label)
 		self.statusBar().addPermanentWidget(self.elapsed_label)
 		self._set_running(False)
 
@@ -553,6 +561,20 @@ class MainWindow(QMainWindow):
 		self.start_button.setText("Stop" if running else "Start")
 		icon = QStyle.StandardPixmap.SP_MediaStop if running else QStyle.StandardPixmap.SP_MediaPlay
 		self.start_button.setIcon(self.style().standardIcon(icon))
+
+	def _reset_fps(self) -> None:
+		self._fps_frames = 0
+		self._fps_started = perf_counter()
+		self.fps_label.setText("FPS 0.0")
+
+	def _update_fps(self, rendered: bool) -> None:
+		self._fps_frames += int(rendered)
+		now = perf_counter()
+		elapsed = now - self._fps_started
+		if elapsed >= 1.0:
+			self.fps_label.setText(f"FPS {self._fps_frames / elapsed:.1f}")
+			self._fps_frames = 0
+			self._fps_started = now
 
 	def _show_notice(self, message: str = "") -> None:
 		self.notice.setText(message)
@@ -654,6 +676,7 @@ class MainWindow(QMainWindow):
 			self.state_label.setText("Unavailable")
 			self._show_notice(f"Cannot start audio input: {exception}. Check microphone permissions and capture settings.")
 			return
+		self._reset_fps()
 		self._set_running(True)
 		self.state_label.setText(
 			f"Live | {settings.sample_rate:,.0f} Hz | {settings.channels} ch | {settings.block_size:,} samples"
@@ -661,6 +684,7 @@ class MainWindow(QMainWindow):
 
 	def _stop_capture(self) -> None:
 		self.capture.stop()
+		self._reset_fps()
 		self._set_running(False)
 		self.state_label.setText("Stopped")
 
@@ -682,7 +706,9 @@ class MainWindow(QMainWindow):
 			self._stop_capture()
 			self._show_notice("Audio input stopped unexpectedly. Check the device and restart capture.")
 			return
+		previous_frames = self._last_frames
 		self._render_measurement()
+		self._update_fps(self._last_frames != previous_frames)
 
 	def _render_measurement(self) -> None:
 		buffer = self.capture.buffer
