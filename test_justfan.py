@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import numpy as np
 from PySide6.QtCore import QSettings, Qt, QTimer
-from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QLineEdit
+from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QDialogButtonBox, QLineEdit, QStackedWidget, QTableWidget
 
 import JustFan as justfan
 
@@ -268,11 +268,16 @@ class InterfaceTests(unittest.TestCase):
         self.query.return_value = []
         self.window.refresh_devices()
         self.assertFalse(self.window.start_button.isEnabled())
+        self.assertFalse(self.window.commands_button.isEnabled())
+        with patch.object(justfan, "QDialog") as dialog:
+            self.window._configure_all_commands()
+            dialog.assert_not_called()
         self.assertEqual(self.window.channel_widgets, [])
         self.assertEqual(self.window.spectra.curves, [])
         self.query.return_value = self.devices
         self.window.refresh_devices()
         self.assertTrue(self.window.start_button.isEnabled())
+        self.assertTrue(self.window.commands_button.isEnabled())
         self.assertEqual(len(self.window.channel_widgets), 2)
 
     def test_disconnect_is_reported(self) -> None:
@@ -283,30 +288,264 @@ class InterfaceTests(unittest.TestCase):
         self.assertTrue(stream.closed)
         self.assertIn("stopped unexpectedly", self.window.notice.text())
 
-    def test_sensor_commands_are_saved_without_execution(self) -> None:
-        captured = []
+    def edit_sensor_commands(self, interaction, opener=None) -> None:
+        failures = []
 
-        def save_commands() -> None:
+        def edit() -> None:
             assert self.application is not None
             dialog = self.application.activeModalWidget()
             if not isinstance(dialog, QDialog):
+                failures.append(AssertionError("The sensor command dialog did not open."))
                 return
-            fields = dialog.findChildren(QLineEdit)
-            fields[0].setText("temperature-reader --value")
-            fields[1].setText("fan-reader --rpm")
-            captured.extend(field.text() for field in fields)
+            try:
+                interaction(dialog)
+            except Exception as exception:
+                failures.append(exception)
+            finally:
+                if dialog.isVisible():
+                    dialog.reject()
+
+        def timeout() -> None:
+            failures.append(AssertionError("The sensor command dialog did not close."))
+            assert self.application is not None
+            dialog = self.application.activeModalWidget()
+            if isinstance(dialog, QDialog):
+                dialog.reject()
+
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(timeout)
+        timer.start(1000)
+        QTimer.singleShot(0, edit)
+        try:
+            (opener if opener is not None else self.window._configure_commands)()
+        finally:
+            timer.stop()
+        if failures:
+            raise failures[0]
+
+    def command_fields(self, dialog: QDialog) -> tuple[QComboBox, QLineEdit, QLineEdit]:
+        channel_combo = dialog.findChild(QComboBox, "commandChannel")
+        pages = dialog.findChild(QStackedWidget, "commandPages")
+        assert channel_combo is not None and pages is not None
+        page = pages.currentWidget()
+        assert page is not None
+        temperature = page.findChild(QLineEdit, "temperatureCommand")
+        speed = page.findChild(QLineEdit, "speedCommand")
+        assert temperature is not None and speed is not None
+        return channel_combo, temperature, speed
+
+    def test_bulk_sensor_commands_shows_and_saves_every_channel_without_execution(self) -> None:
+        def save_all_commands(dialog: QDialog) -> None:
+            table = dialog.findChild(QTableWidget, "allCommandChannels")
+            assert table is not None
+            self.assertEqual(table.rowCount(), 2)
+            self.assertIsNone(dialog.findChild(QComboBox, "commandChannel"))
+            for row in range(table.rowCount()):
+                self.assertEqual(table.item(row, 0).text(), f"Channel {row + 1:02d}")
+                temperature = table.cellWidget(row, 1)
+                speed = table.cellWidget(row, 2)
+                assert isinstance(temperature, QLineEdit) and isinstance(speed, QLineEdit)
+                self.assertTrue(temperature.isVisible())
+                self.assertTrue(speed.isVisible())
+                temperature.setText(f"temperature-reader --channel {row + 1}")
+                speed.setText(f"fan-reader --channel {row + 1}")
             buttons = dialog.findChild(QDialogButtonBox)
             assert buttons is not None
             buttons.button(QDialogButtonBox.StandardButton.Save).click()
 
-        QTimer.singleShot(0, save_commands)
-        QTimer.singleShot(1000, lambda: self.application.activeModalWidget().reject() if self.application is not None and isinstance(self.application.activeModalWidget(), QDialog) else None)
         with patch("subprocess.Popen") as subprocess:
-            self.window._configure_commands()
+            self.edit_sensor_commands(save_all_commands, self.window.commands_button.click)
             subprocess.assert_not_called()
-        self.assertEqual(len(captured), 2)
-        self.assertEqual(self.settings.value("commands/temperature"), captured[0])
-        self.assertEqual(self.settings.value("commands/speed"), captured[1])
+        prefix = "commands/devices/Test%20API/Stereo%20microphone/channels"
+        for channel in (1, 2):
+            self.assertEqual(self.settings.value(f"{prefix}/{channel}/temperature"), f"temperature-reader --channel {channel}")
+            self.assertEqual(self.settings.value(f"{prefix}/{channel}/speed"), f"fan-reader --channel {channel}")
+
+    def test_bulk_sensor_commands_cancel_discards_all_row_changes(self) -> None:
+        prefix = "commands/devices/Test%20API/Stereo%20microphone/channels"
+        for channel in (1, 2):
+            self.settings.setValue(f"{prefix}/{channel}/temperature", f"temperature-{channel}")
+            self.settings.setValue(f"{prefix}/{channel}/speed", f"speed-{channel}")
+
+        def cancel_all_changes(dialog: QDialog) -> None:
+            table = dialog.findChild(QTableWidget, "allCommandChannels")
+            assert table is not None
+            for row in range(table.rowCount()):
+                temperature = table.cellWidget(row, 1)
+                speed = table.cellWidget(row, 2)
+                assert isinstance(temperature, QLineEdit) and isinstance(speed, QLineEdit)
+                self.assertEqual(temperature.text(), f"temperature-{row + 1}")
+                self.assertEqual(speed.text(), f"speed-{row + 1}")
+                temperature.setText("unsaved temperature")
+                speed.setText("unsaved speed")
+            buttons = dialog.findChild(QDialogButtonBox)
+            assert buttons is not None
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).click()
+
+        self.edit_sensor_commands(cancel_all_changes, self.window.commands_button.click)
+        for channel in (1, 2):
+            self.assertEqual(self.settings.value(f"{prefix}/{channel}/temperature"), f"temperature-{channel}")
+            self.assertEqual(self.settings.value(f"{prefix}/{channel}/speed"), f"speed-{channel}")
+
+    def test_bulk_and_individual_command_editors_share_saved_configuration(self) -> None:
+        def save_individual_commands(dialog: QDialog) -> None:
+            channel_combo, temperature, speed = self.command_fields(dialog)
+            self.assertEqual(channel_combo.currentData(), 1)
+            temperature.setText("individual-temperature")
+            speed.setText("individual-speed")
+            dialog.accept()
+
+        self.edit_sensor_commands(save_individual_commands, self.window.channel_widgets[1].commands_button.click)
+
+        def update_bulk_commands(dialog: QDialog) -> None:
+            table = dialog.findChild(QTableWidget, "allCommandChannels")
+            assert table is not None
+            temperature = table.cellWidget(1, 1)
+            speed = table.cellWidget(1, 2)
+            assert isinstance(temperature, QLineEdit) and isinstance(speed, QLineEdit)
+            self.assertEqual(temperature.text(), "individual-temperature")
+            self.assertEqual(speed.text(), "individual-speed")
+            temperature.setText("bulk-temperature")
+            speed.setText("bulk-speed")
+            dialog.accept()
+
+        self.edit_sensor_commands(update_bulk_commands, self.window.commands_button.click)
+
+        def check_individual_commands(dialog: QDialog) -> None:
+            channel_combo, temperature, speed = self.command_fields(dialog)
+            self.assertEqual(channel_combo.currentData(), 1)
+            self.assertEqual(temperature.text(), "bulk-temperature")
+            self.assertEqual(speed.text(), "bulk-speed")
+            dialog.reject()
+
+        self.edit_sensor_commands(check_individual_commands, self.window.channel_widgets[1].commands_button.click)
+
+    def test_sensor_commands_are_saved_per_channel_without_execution(self) -> None:
+        def save_commands(dialog: QDialog) -> None:
+            channel_combo, temperature, speed = self.command_fields(dialog)
+            self.assertEqual(channel_combo.count(), 2)
+            temperature.setText("temperature-reader --channel 1")
+            speed.setText("fan-reader --channel 1")
+            channel_combo.setCurrentIndex(1)
+            _, temperature, speed = self.command_fields(dialog)
+            self.assertEqual(temperature.text(), "")
+            self.assertEqual(speed.text(), "")
+            temperature.setText("temperature-reader --channel 2")
+            speed.setText("fan-reader --channel 2")
+            channel_combo.setCurrentIndex(0)
+            _, temperature, speed = self.command_fields(dialog)
+            self.assertEqual(temperature.text(), "temperature-reader --channel 1")
+            self.assertEqual(speed.text(), "fan-reader --channel 1")
+            buttons = dialog.findChild(QDialogButtonBox)
+            assert buttons is not None
+            buttons.button(QDialogButtonBox.StandardButton.Save).click()
+
+        with patch("subprocess.Popen") as subprocess:
+            self.edit_sensor_commands(save_commands)
+            subprocess.assert_not_called()
+        prefix = "commands/devices/Test%20API/Stereo%20microphone/channels"
+        for channel in (1, 2):
+            self.assertEqual(self.settings.value(f"{prefix}/{channel}/temperature"), f"temperature-reader --channel {channel}")
+            self.assertEqual(self.settings.value(f"{prefix}/{channel}/speed"), f"fan-reader --channel {channel}")
+
+    def test_channel_button_loads_matching_commands_and_cancel_discards_edits(self) -> None:
+        prefix = "commands/devices/Test%20API/Stereo%20microphone/channels/2"
+        self.settings.setValue(f"{prefix}/temperature", "temperature-reader --channel 2")
+        self.settings.setValue(f"{prefix}/speed", "fan-reader --channel 2")
+
+        def cancel_changes(dialog: QDialog) -> None:
+            channel_combo, temperature, speed = self.command_fields(dialog)
+            self.assertEqual(channel_combo.currentData(), 1)
+            self.assertEqual(temperature.text(), "temperature-reader --channel 2")
+            self.assertEqual(speed.text(), "fan-reader --channel 2")
+            temperature.setText("unsaved temperature")
+            speed.setText("unsaved speed")
+            buttons = dialog.findChild(QDialogButtonBox)
+            assert buttons is not None
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).click()
+
+        self.edit_sensor_commands(cancel_changes, self.window.channel_widgets[1].commands_button.click)
+        self.assertEqual(self.settings.value(f"{prefix}/temperature"), "temperature-reader --channel 2")
+        self.assertEqual(self.settings.value(f"{prefix}/speed"), "fan-reader --channel 2")
+
+    def test_sensor_commands_are_device_specific_and_ignore_device_index_changes(self) -> None:
+        stereo_prefix = "commands/devices/Test%20API/Stereo%20microphone/channels/1"
+        self.settings.setValue(f"{stereo_prefix}/temperature", "stereo-temperature")
+        self.settings.setValue(f"{stereo_prefix}/speed", "stereo-speed")
+        self.window.device_combo.setCurrentIndex(self.window.device_combo.findText(self.devices[1].label))
+
+        def save_mono_commands(dialog: QDialog) -> None:
+            channel_combo, temperature, speed = self.command_fields(dialog)
+            self.assertEqual(channel_combo.count(), 1)
+            self.assertEqual(temperature.text(), "")
+            self.assertEqual(speed.text(), "")
+            temperature.setText("mono-temperature")
+            speed.setText("mono-speed")
+            dialog.accept()
+
+        self.edit_sensor_commands(save_mono_commands)
+        mono_prefix = "commands/devices/Test%20API/Mono%20microphone/channels/1"
+        self.assertEqual(self.settings.value(f"{mono_prefix}/temperature"), "mono-temperature")
+        self.assertEqual(self.settings.value(f"{mono_prefix}/speed"), "mono-speed")
+        self.query.return_value = [justfan.InputDevice(33, "Stereo microphone", "Test API", 2, 48000, 0.01), self.devices[1]]
+        self.window.refresh_devices()
+        self.window.device_combo.setCurrentIndex(self.window.device_combo.findText(self.devices[0].label))
+
+        def check_stereo_commands(dialog: QDialog) -> None:
+            _, temperature, speed = self.command_fields(dialog)
+            self.assertEqual(temperature.text(), "stereo-temperature")
+            self.assertEqual(speed.text(), "stereo-speed")
+            dialog.reject()
+
+        self.edit_sensor_commands(check_stereo_commands)
+
+    def test_sensor_commands_survive_reducing_and_restoring_channel_count(self) -> None:
+        prefix = "commands/devices/Test%20API/Stereo%20microphone/channels/2"
+        self.settings.setValue(f"{prefix}/temperature", "second-temperature")
+        self.settings.setValue(f"{prefix}/speed", "second-speed")
+        self.window.channel_count.setValue(1)
+        self.window.start_capture()
+
+        def save_single_channel(dialog: QDialog) -> None:
+            channel_combo, _, _ = self.command_fields(dialog)
+            self.assertEqual(channel_combo.count(), 1)
+            dialog.accept()
+
+        self.edit_sensor_commands(save_single_channel)
+        self.window.channel_count.setValue(2)
+        self.window.start_capture()
+
+        def check_second_channel(dialog: QDialog) -> None:
+            _, temperature, speed = self.command_fields(dialog)
+            self.assertEqual(temperature.text(), "second-temperature")
+            self.assertEqual(speed.text(), "second-speed")
+            dialog.reject()
+
+        self.edit_sensor_commands(check_second_channel, self.window.channel_widgets[1].commands_button.click)
+
+    def test_legacy_global_commands_migrate_only_to_channel_one_on_save(self) -> None:
+        self.settings.setValue("commands/temperature", "legacy-temperature")
+        self.settings.setValue("commands/speed", "legacy-speed")
+
+        def migrate_commands(dialog: QDialog) -> None:
+            channel_combo, temperature, speed = self.command_fields(dialog)
+            self.assertEqual(temperature.text(), "legacy-temperature")
+            self.assertEqual(speed.text(), "legacy-speed")
+            channel_combo.setCurrentIndex(1)
+            _, temperature, speed = self.command_fields(dialog)
+            self.assertEqual(temperature.text(), "")
+            self.assertEqual(speed.text(), "")
+            dialog.accept()
+
+        self.edit_sensor_commands(migrate_commands)
+        prefix = "commands/devices/Test%20API/Stereo%20microphone/channels"
+        self.assertEqual(self.settings.value(f"{prefix}/1/temperature"), "legacy-temperature")
+        self.assertEqual(self.settings.value(f"{prefix}/1/speed"), "legacy-speed")
+        self.assertEqual(self.settings.value(f"{prefix}/2/temperature"), "")
+        self.assertEqual(self.settings.value(f"{prefix}/2/speed"), "")
+        self.assertFalse(self.settings.contains("commands/temperature"))
+        self.assertFalse(self.settings.contains("commands/speed"))
 
 
 if __name__ == "__main__":

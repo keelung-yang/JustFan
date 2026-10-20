@@ -95,10 +95,26 @@ captured samples and excludes stopped time; an input overflow can lose samples.
 
 ## Sensor Commands
 
-**Sensor commands** provides separate temperature and fan-speed command fields.
-They are saved in per-user Qt settings, along with window geometry and divider
-position. Commands are not executed, parsed, or attached to channels in this
-version. Temperature and speed remain unavailable regardless of the saved text.
+Each channel has its own temperature and fan-speed commands. Open a channel's
+configuration icon directly to edit that channel. The top-right **Sensor commands**
+button opens an all-channel table, with one row per channel and separate columns
+for temperature and fan-speed commands. All channels can be edited together
+without switching a channel selector; the table scrolls for larger channel counts.
+**Save** saves every row, while **Cancel** discards every pending edit.
+
+The individual channel dialog remains available with its channel selector. Both
+editors share the same saved configuration.
+
+Commands are saved in per-user Qt settings by device name, host API, and channel
+number, independently for each input device. Device index changes do not affect
+these settings. Reducing the input channel count does not delete configurations
+for the other channels; they return when those channels are enabled again.
+Existing global commands are offered as Channel 01's initial values and migrate
+to that device's Channel 01 on the first **Save**.
+
+Window geometry and divider position are also saved in per-user Qt settings.
+Commands are not executed or parsed in this version. Temperature and speed remain
+unavailable regardless of the saved text.
 
 ## Tests
 

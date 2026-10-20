@@ -5,12 +5,14 @@ import math
 import sys
 from dataclasses import dataclass
 from threading import Lock
+from urllib.parse import quote
 
 import numpy as np
 import sounddevice as sd
-from PySide6.QtCore import QByteArray, QSettings, QSignalBlocker, Qt, QTimer
+from PySide6.QtCore import QByteArray, QSettings, QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QPalette, QResizeEvent
 from PySide6.QtWidgets import (
+	QAbstractItemView,
 	QApplication,
 	QComboBox,
 	QDialog,
@@ -19,6 +21,7 @@ from PySide6.QtWidgets import (
 	QFormLayout,
 	QFrame,
 	QGridLayout,
+	QHeaderView,
 	QHBoxLayout,
 	QLabel,
 	QLineEdit,
@@ -28,7 +31,10 @@ from PySide6.QtWidgets import (
 	QSizePolicy,
 	QSpinBox,
 	QSplitter,
+	QStackedWidget,
 	QStyle,
+	QTableWidget,
+	QTableWidgetItem,
 	QToolButton,
 	QVBoxLayout,
 	QWidget,
@@ -212,8 +218,11 @@ class AudioCapture:
 
 
 class ChannelWidget(QFrame):
+	sensor_commands_requested = Signal(int)
+
 	def __init__(self, channel: int, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
+		self._channel = channel
 		self.setObjectName("channel")
 		self.setMinimumWidth(264)
 		layout = QGridLayout(self)
@@ -222,7 +231,16 @@ class ChannelWidget(QFrame):
 		layout.setVerticalSpacing(10)
 		heading = QLabel(f"Channel {channel + 1:02d}")
 		heading.setStyleSheet(f"color: {CHANNEL_COLORS[channel % len(CHANNEL_COLORS)]}; font-weight: 600;")
-		layout.addWidget(heading, 0, 0)
+		self.commands_button = QToolButton()
+		self.commands_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
+		self.commands_button.setToolTip(f"Configure Channel {channel + 1:02d} sensor commands")
+		self.commands_button.setAccessibleName(f"Configure Channel {channel + 1:02d} sensor commands")
+		self.commands_button.clicked.connect(self._request_sensor_commands)
+		header = QHBoxLayout()
+		header.addWidget(heading)
+		header.addStretch()
+		header.addWidget(self.commands_button)
+		layout.addLayout(header, 0, 0)
 		layout.addWidget(QLabel("Current"), 0, 1, Qt.AlignmentFlag.AlignLeft)
 		layout.addWidget(QLabel("Peak"), 0, 2, Qt.AlignmentFlag.AlignRight)
 		self.current_values = []
@@ -246,6 +264,9 @@ class ChannelWidget(QFrame):
 		self.peak_values[0].setToolTip("Highest block RMS level in this measurement, not sample-peak amplitude.")
 		for label in self.current_values[1:] + self.peak_values[1:]:
 			label.setToolTip("Sensor command execution is not available in this version.")
+
+	def _request_sensor_commands(self) -> None:
+		self.sensor_commands_requested.emit(self._channel)
 
 	def update_levels(self, current: float, peak: float) -> None:
 		self.current_values[0].setText(f"{current:.1f}")
@@ -372,10 +393,10 @@ class MainWindow(QMainWindow):
 		title.setFont(QFont(self.font().family(), 18, QFont.Weight.DemiBold))
 		heading.addWidget(title)
 		heading.addStretch()
-		commands = QPushButton("Sensor commands")
-		commands.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
-		commands.clicked.connect(self._configure_commands)
-		heading.addWidget(commands)
+		self.commands_button = QPushButton("Sensor commands")
+		self.commands_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+		self.commands_button.clicked.connect(self._configure_all_commands)
+		heading.addWidget(self.commands_button)
 		control_layout.addLayout(heading)
 		device_row = QHBoxLayout()
 		device_row.addWidget(QLabel("Input device"))
@@ -505,8 +526,10 @@ class MainWindow(QMainWindow):
 		self.channel_widgets.clear()
 		for channel in range(count):
 			widget = ChannelWidget(channel)
+			widget.sensor_commands_requested.connect(self._configure_commands)
 			self.channel_layout.addWidget(widget)
 			self.channel_widgets.append(widget)
+		self.commands_button.setEnabled(count > 0)
 		if self.channel_widgets:
 			minimum_width = self.channel_widgets[0].minimumSizeHint().width() + 24
 			minimum_width += self.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
@@ -648,26 +671,108 @@ class MainWindow(QMainWindow):
 			self._show_notice()
 			self._render_measurement()
 
-	def _configure_commands(self) -> None:
-		dialog = QDialog(self)
-		dialog.setWindowTitle("Sensor commands")
-		dialog.resize(580, 200)
-		layout = QFormLayout(dialog)
-		temperature = QLineEdit(str(self.settings.value("commands/temperature", "")))
-		speed = QLineEdit(str(self.settings.value("commands/speed", "")))
+	def _command_fields(self, device: InputDevice, channel: int) -> tuple[str, QLineEdit, QLineEdit]:
+		device_key = f"{quote(device.host_api, safe='')}/{quote(device.name, safe='')}"
+		prefix = f"commands/devices/{device_key}/channels/{channel + 1}"
+		legacy_temperature = self.settings.value("commands/temperature", "") if channel == 0 else ""
+		legacy_speed = self.settings.value("commands/speed", "") if channel == 0 else ""
+		temperature = QLineEdit(str(self.settings.value(f"{prefix}/temperature", legacy_temperature)))
+		speed = QLineEdit(str(self.settings.value(f"{prefix}/speed", legacy_speed)))
+		temperature.setObjectName("temperatureCommand")
+		speed.setObjectName("speedCommand")
 		for field in (temperature, speed):
 			field.setPlaceholderText("Not configured")
 			field.setToolTip("Saved locally only. Command execution is reserved for a future version.")
-		layout.addRow("Temperature command", temperature)
-		layout.addRow("Fan speed command", speed)
-		layout.addRow("Status", QLabel("Inactive"))
+		return prefix, temperature, speed
+
+	def _save_command_fields(self, command_fields: list[tuple[str, QLineEdit, QLineEdit]]) -> None:
+		for prefix, temperature, speed in command_fields:
+			self.settings.setValue(f"{prefix}/temperature", temperature.text())
+			self.settings.setValue(f"{prefix}/speed", speed.text())
+		self.settings.remove("commands/temperature")
+		self.settings.remove("commands/speed")
+
+	def _configure_all_commands(self) -> None:
+		device = self.device_combo.currentData()
+		if not isinstance(device, InputDevice) or not self.channel_widgets:
+			return
+		dialog = QDialog(self)
+		dialog.setWindowTitle("Sensor commands - All channels")
+		dialog.resize(980, min(640, 180 + 40 * len(self.channel_widgets)))
+		layout = QVBoxLayout(dialog)
+		header = QFormLayout()
+		device_label = QLabel(device.label)
+		device_label.setTextFormat(Qt.TextFormat.PlainText)
+		device_label.setWordWrap(True)
+		header.addRow("Device", device_label)
+		header.addRow("Status", QLabel("Inactive"))
+		layout.addLayout(header)
+		table = QTableWidget(len(self.channel_widgets), 3)
+		table.setObjectName("allCommandChannels")
+		table.setHorizontalHeaderLabels(["Channel", "Temperature command", "Fan speed command"])
+		table.verticalHeader().hide()
+		table.verticalHeader().setDefaultSectionSize(40)
+		table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+		for column in (1, 2):
+			table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
+		table.setAlternatingRowColors(True)
+		table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+		table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+		command_fields = []
+		for channel in range(len(self.channel_widgets)):
+			fields = self._command_fields(device, channel)
+			_, temperature, speed = fields
+			table.setItem(channel, 0, QTableWidgetItem(f"Channel {channel + 1:02d}"))
+			table.setCellWidget(channel, 1, temperature)
+			table.setCellWidget(channel, 2, speed)
+			command_fields.append(fields)
+		layout.addWidget(table)
 		buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
 		buttons.accepted.connect(dialog.accept)
 		buttons.rejected.connect(dialog.reject)
-		layout.addRow(buttons)
+		layout.addWidget(buttons)
 		if dialog.exec() == QDialog.DialogCode.Accepted:
-			self.settings.setValue("commands/temperature", temperature.text())
-			self.settings.setValue("commands/speed", speed.text())
+			self._save_command_fields(command_fields)
+
+	def _configure_commands(self, channel: int = 0) -> None:
+		device = self.device_combo.currentData()
+		if not isinstance(device, InputDevice) or not 0 <= channel < len(self.channel_widgets):
+			return
+		dialog = QDialog(self)
+		dialog.setWindowTitle("Sensor commands")
+		dialog.resize(640, 260)
+		layout = QVBoxLayout(dialog)
+		header = QFormLayout()
+		device_label = QLabel(device.label)
+		device_label.setTextFormat(Qt.TextFormat.PlainText)
+		device_label.setWordWrap(True)
+		header.addRow("Device", device_label)
+		channel_combo = QComboBox()
+		channel_combo.setObjectName("commandChannel")
+		header.addRow("Channel", channel_combo)
+		layout.addLayout(header)
+		pages = QStackedWidget()
+		pages.setObjectName("commandPages")
+		command_fields: list[tuple[str, QLineEdit, QLineEdit]] = []
+		for index in range(len(self.channel_widgets)):
+			channel_combo.addItem(f"Channel {index + 1:02d}", index)
+			prefix, temperature, speed = self._command_fields(device, index)
+			page = QWidget()
+			form = QFormLayout(page)
+			form.addRow("Temperature command", temperature)
+			form.addRow("Fan speed command", speed)
+			form.addRow("Status", QLabel("Inactive"))
+			pages.addWidget(page)
+			command_fields.append((prefix, temperature, speed))
+		channel_combo.currentIndexChanged.connect(pages.setCurrentIndex)
+		channel_combo.setCurrentIndex(channel)
+		layout.addWidget(pages)
+		buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+		buttons.accepted.connect(dialog.accept)
+		buttons.rejected.connect(dialog.reject)
+		layout.addWidget(buttons)
+		if dialog.exec() == QDialog.DialogCode.Accepted:
+			self._save_command_fields(command_fields)
 
 	def closeEvent(self, event: QCloseEvent) -> None:
 		self.timer.stop()
