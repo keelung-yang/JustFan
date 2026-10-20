@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import numpy as np
 from PySide6.QtCore import QSettings, Qt, QTimer
-from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QDialogButtonBox, QLineEdit, QStackedWidget, QTableWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QDialogButtonBox, QLabel, QLineEdit, QStackedWidget, QTableWidget, QWidget
 
 import JustFan as justfan
 
@@ -180,6 +180,36 @@ class InterfaceTests(unittest.TestCase):
         assert settings is not None and stream is not None
         stream.callback(np.full((settings.block_size, settings.channels), amplitude), settings.block_size, None, "")
         self.window._update_measurement()
+
+    def test_compact_controls_remove_duplicate_title_and_reuse_parameter_row(self) -> None:
+        controls = self.window.findChild(QWidget, "controls")
+        assert controls is not None
+        control_layout = controls.layout()
+        assert control_layout is not None
+        self.assertEqual(self.window.windowTitle(), "JustFan")
+        self.assertFalse(any(label.text() == "JustFan" for label in controls.findChildren(QLabel)))
+        self.assertEqual(control_layout.count(), 2)
+        parameters = control_layout.itemAt(1).layout()
+        assert parameters is not None
+        self.assertIs(parameters.itemAtPosition(0, 4).widget(), self.window.commands_button)
+        self.assertIs(parameters.itemAtPosition(1, 4).widget(), self.window.apply_button)
+        assert self.application is not None
+        for width in (1360, 860):
+            with self.subTest(width=width):
+                self.window.resize(width, 680)
+                self.application.processEvents()
+                self.assertGreaterEqual(self.window.width(), controls.minimumSizeHint().width())
+                widgets = (
+                    self.window.sample_rate, self.window.channel_count, self.window.fft_size,
+                    self.window.latency, self.window.commands_button, self.window.apply_button,
+                )
+                for index, widget in enumerate(widgets):
+                    self.assertTrue(controls.rect().contains(widget.geometry()))
+                    for other in widgets[index + 1:]:
+                        self.assertFalse(widget.geometry().intersects(other.geometry()))
+                self.assertGreater(self.window.commands_button.y(), self.window.device_combo.geometry().bottom())
+                self.assertLess(self.window.commands_button.geometry().bottom(), self.window.apply_button.y())
+                self.assertGreaterEqual(self.window.commands_button.width(), self.window.commands_button.sizeHint().width())
 
     def test_current_peak_placeholders_and_graphs(self) -> None:
         self.push(0.5)
