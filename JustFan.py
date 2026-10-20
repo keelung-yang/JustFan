@@ -14,6 +14,7 @@ from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QPalette, Q
 from PySide6.QtWidgets import (
 	QAbstractItemView,
 	QApplication,
+	QCheckBox,
 	QComboBox,
 	QDialog,
 	QDialogButtonBox,
@@ -79,26 +80,35 @@ class AudioFrame:
 	peaks: np.ndarray
 	frames: int
 	warning: str
+	spectrum: np.ndarray | None = None
+	spectrum_peaks: np.ndarray | None = None
 
 
 class CaptureBuffer:
-	"""Keep the latest waveform and every block's measurement peak."""
+	"""Keep current readings and every block's level and spectrum peaks."""
 
-	def __init__(self, channels: int) -> None:
+	def __init__(self, channels: int, analyzer: SpectrumAnalyzer | None = None) -> None:
 		self._lock = Lock()
+		self._analyzer = analyzer
 		self._samples: np.ndarray | None = None
 		self._levels = np.full(channels, DB_FLOOR)
 		self._peaks = np.full(channels, DB_FLOOR)
+		self._spectrum: np.ndarray | None = None
+		self._spectrum_peaks: np.ndarray | None = None
 		self._frames = 0
 		self._warning = ""
 
 	def push(self, samples: np.ndarray, warning: str = "") -> None:
 		samples = samples.copy()
 		levels = to_dbfs(np.sqrt(np.mean(np.square(samples, dtype=np.float64), axis=0)))
+		spectrum = self._analyzer.analyze(samples) if self._analyzer is not None else None
 		with self._lock:
 			self._samples = samples
 			self._levels = levels
 			self._peaks = np.maximum(self._peaks, levels)
+			self._spectrum = spectrum
+			if spectrum is not None:
+				self._spectrum_peaks = spectrum if self._spectrum_peaks is None else np.maximum(self._spectrum_peaks, spectrum)
 			self._frames += len(samples)
 			if warning:
 				self._warning = warning
@@ -113,11 +123,14 @@ class CaptureBuffer:
 				self._peaks.copy(),
 				self._frames,
 				self._warning,
+				self._spectrum.copy() if self._spectrum is not None else None,
+				self._spectrum_peaks.copy() if self._spectrum_peaks is not None else None,
 			)
 
 	def reset_peaks(self) -> None:
 		with self._lock:
 			self._peaks = self._levels.copy()
+			self._spectrum_peaks = self._spectrum.copy() if self._spectrum is not None else None
 			self._frames = 0
 			self._warning = ""
 
@@ -182,7 +195,7 @@ class AudioCapture:
 			samplerate=settings.sample_rate,
 			dtype="float32",
 		)
-		buffer = CaptureBuffer(settings.channels)
+		buffer = CaptureBuffer(settings.channels, SpectrumAnalyzer(settings.sample_rate, settings.block_size))
 
 		def callback(samples, _frames, _time_info, status) -> None:
 			buffer.push(samples, str(status) if status else "")
@@ -278,6 +291,8 @@ class SpectrumPanel(QScrollArea):
 		super().__init__(parent)
 		self.plots: list[pg.PlotWidget] = []
 		self.curves = []
+		self.peak_curves = []
+		self._peak_hold_visible = True
 		self.columns = 0
 		self._empty: QLabel | None = None
 		self.setWidgetResizable(True)
@@ -296,6 +311,7 @@ class SpectrumPanel(QScrollArea):
 				widget.deleteLater()
 		self.plots.clear()
 		self.curves.clear()
+		self.peak_curves.clear()
 		self.columns = 0
 		self._empty = None
 		if not count:
@@ -313,15 +329,36 @@ class SpectrumPanel(QScrollArea):
 			plot.setLabel("left", "RMS amplitude", units="dBFS")
 			plot.showGrid(x=True, y=True, alpha=0.15)
 			plot.setXRange(0, sample_rate / 2, padding=0)
-			plot.setYRange(DB_FLOOR, 0, padding=0)
+			plot.setYRange(DB_FLOOR - 5, 0, padding=0)
 			plot.setLimits(xMin=0, xMax=sample_rate / 2, yMin=DB_FLOOR - 10, yMax=12)
 			plot.hideButtons()
-			curve = plot.plot(pen=pg.mkPen(color, width=1.5))
-			curve.setDownsampling(auto=True, method="peak")
-			curve.setClipToView(True)
+			plot.addLegend(offset=(-10, 10), labelTextSize="9pt")
+			curve = plot.plot(pen=pg.mkPen(color, width=1.5), name="Current")
+			curve.setZValue(1)
+			peak_curve = plot.plot(
+				pen=pg.mkPen("#b45f16", width=2.0, style=Qt.PenStyle.DashLine),
+				name="Peak hold" if self._peak_hold_visible else None,
+			)
+			peak_curve.setZValue(2)
+			for trace in (curve, peak_curve):
+				trace.setDownsampling(auto=True, method="peak")
+				trace.setClipToView(True)
+			peak_curve.setVisible(self._peak_hold_visible)
 			self.plots.append(plot)
 			self.curves.append(curve)
+			self.peak_curves.append(peak_curve)
 		self._reflow()
+
+	def set_peak_hold_visible(self, visible: bool) -> None:
+		if visible == self._peak_hold_visible:
+			return
+		self._peak_hold_visible = visible
+		for plot, curve in zip(self.plots, self.peak_curves):
+			curve.setVisible(visible)
+			if visible:
+				plot.plotItem.legend.addItem(curve, "Peak hold")
+			else:
+				plot.plotItem.legend.removeItem(curve)
 
 	def _reflow(self) -> None:
 		if not self.plots:
@@ -347,9 +384,10 @@ class SpectrumPanel(QScrollArea):
 		super().resizeEvent(event)
 		self._reflow()
 
-	def update_spectra(self, frequencies: np.ndarray, levels: np.ndarray) -> None:
+	def update_spectra(self, frequencies: np.ndarray, levels: np.ndarray, peaks: np.ndarray) -> None:
 		for channel, curve in enumerate(self.curves):
 			curve.setData(frequencies, levels[:, channel])
+			self.peak_curves[channel].setData(frequencies, peaks[:, channel])
 
 
 class MainWindow(QMainWindow):
@@ -407,7 +445,7 @@ class MainWindow(QMainWindow):
 		device_row.addWidget(self.start_button)
 		self.reset_button = QPushButton("Reset peaks")
 		self.reset_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogResetButton))
-		self.reset_button.setToolTip("Reset noise peaks and measured time; retain current readings.")
+		self.reset_button.setToolTip("Reset level and spectrum peaks and measured time; retain current readings.")
 		self.reset_button.clicked.connect(self._reset_measurement)
 		device_row.addWidget(self.reset_button)
 		control_layout.addLayout(device_row)
@@ -487,10 +525,17 @@ class MainWindow(QMainWindow):
 		right.setMinimumWidth(346)
 		right_layout = QVBoxLayout(right)
 		right_layout.setContentsMargins(0, 0, 0, 0)
-		chart_heading = QLabel("Noise spectrum")
+		chart_heading = QHBoxLayout()
 		chart_heading.setContentsMargins(12, 12, 12, 0)
-		right_layout.addWidget(chart_heading)
+		chart_heading.addWidget(QLabel("Noise spectrum"))
+		chart_heading.addStretch()
+		self.peak_hold_checkbox = QCheckBox("Peak hold")
+		self.peak_hold_checkbox.setChecked(True)
+		self.peak_hold_checkbox.setToolTip("Show the highest level at each frequency since measurement start or the last peak reset.")
+		chart_heading.addWidget(self.peak_hold_checkbox)
+		right_layout.addLayout(chart_heading)
 		self.spectra = SpectrumPanel()
+		self.peak_hold_checkbox.toggled.connect(self.spectra.set_peak_hold_visible)
 		right_layout.addWidget(self.spectra)
 		self.splitter.addWidget(left)
 		self.splitter.addWidget(right)
@@ -650,7 +695,8 @@ class MainWindow(QMainWindow):
 		self._last_frames = frame.frames
 		for channel, widget in enumerate(self.channel_widgets):
 			widget.update_levels(float(frame.levels[channel]), float(frame.peaks[channel]))
-		self.spectra.update_spectra(self.analyzer.frequencies, self.analyzer.analyze(frame.samples))
+		if frame.spectrum is not None and frame.spectrum_peaks is not None:
+			self.spectra.update_spectra(self.analyzer.frequencies, frame.spectrum, frame.spectrum_peaks)
 		seconds = int(frame.frames / settings.sample_rate)
 		hours, remainder = divmod(seconds, 3600)
 		minutes, seconds = divmod(remainder, 60)

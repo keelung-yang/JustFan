@@ -92,6 +92,56 @@ class SignalTests(unittest.TestCase):
         nyquist = (0.25 * (-1.0) ** np.arange(self.size))[:, None]
         self.assertAlmostEqual(float(analyzer.analyze(nyquist)[-1, 0]), 20 * np.log10(0.25))
 
+    def test_spectrum_peak_hold_retains_unrendered_bins_per_channel(self) -> None:
+        analyzer = justfan.SpectrumAnalyzer(self.sample_rate, self.size)
+        buffer = justfan.CaptureBuffer(2, analyzer)
+        phase = 2 * np.pi * np.arange(self.size) / self.size
+        later = np.column_stack((0.05 * np.sin(200 * phase), 0.1 * np.sin(300 * phase)))
+        first_spectrum = analyzer.analyze(self.signal)
+        later_spectrum = analyzer.analyze(later)
+        buffer.push(self.signal)
+        buffer.push(later)
+        frame = buffer.snapshot()
+        assert frame is not None and frame.spectrum is not None and frame.spectrum_peaks is not None
+        np.testing.assert_allclose(frame.spectrum, later_spectrum)
+        np.testing.assert_allclose(frame.spectrum_peaks, np.maximum(first_spectrum, later_spectrum))
+        self.assertGreater(float(frame.spectrum_peaks[100, 0]), float(frame.spectrum[100, 0]) + 40)
+        self.assertAlmostEqual(float(frame.spectrum_peaks[300, 1]), 20 * np.log10(0.1 / np.sqrt(2)), places=4)
+
+    def test_reset_spectrum_peak_hold_uses_current_spectrum(self) -> None:
+        analyzer = justfan.SpectrumAnalyzer(self.sample_rate, self.size)
+        buffer = justfan.CaptureBuffer(2, analyzer)
+        buffer.reset_peaks()
+        buffer.push(self.signal)
+        buffer.push(self.signal * 0.1)
+        buffer.reset_peaks()
+        frame = buffer.snapshot()
+        assert frame is not None and frame.spectrum is not None and frame.spectrum_peaks is not None
+        np.testing.assert_array_equal(frame.spectrum_peaks, frame.spectrum)
+        self.assertEqual(frame.frames, 0)
+        frame.spectrum_peaks.fill(0)
+        fresh = buffer.snapshot()
+        assert fresh is not None and fresh.spectrum_peaks is not None
+        np.testing.assert_array_equal(fresh.spectrum_peaks, analyzer.analyze(self.signal * 0.1))
+
+    def test_eight_channel_level_and_spectrum_peaks_are_independent(self) -> None:
+        analyzer = justfan.SpectrumAnalyzer(self.sample_rate, self.size)
+        buffer = justfan.CaptureBuffer(8, analyzer)
+        bins = 40 + 37 * np.arange(8)
+        amplitudes = 0.4 * 0.7 ** np.arange(8)
+        phase = 2 * np.pi * np.arange(self.size)[:, None] / self.size
+        strong = np.sin(phase * bins[None, :]) * amplitudes[None, :]
+        buffer.push(strong)
+        buffer.push(strong * 0.02)
+        frame = buffer.snapshot()
+        assert frame is not None and frame.spectrum is not None and frame.spectrum_peaks is not None
+        expected = 20 * np.log10(amplitudes / np.sqrt(2))
+        np.testing.assert_allclose(frame.peaks, expected, atol=1e-6)
+        np.testing.assert_allclose(frame.levels, expected + 20 * np.log10(0.02), atol=1e-6)
+        np.testing.assert_allclose(frame.spectrum_peaks[bins, np.arange(8)], expected, atol=1e-4)
+        np.testing.assert_array_equal(np.argmax(frame.spectrum_peaks, axis=0), bins)
+        self.assertTrue(np.all(frame.spectrum_peaks >= frame.spectrum))
+
     def test_invalid_spectrum_input(self) -> None:
         with self.assertRaises(ValueError):
             justfan.SpectrumAnalyzer(0, self.size)
@@ -119,6 +169,8 @@ class CaptureTests(unittest.TestCase):
             frame = capture.buffer.snapshot()
             assert frame is not None
             np.testing.assert_allclose(frame.levels, 20 * np.log10(0.5))
+            self.assertIsNotNone(frame.spectrum)
+            self.assertIsNotNone(frame.spectrum_peaks)
             capture.stop()
             self.assertTrue(stream.closed)
             self.assertIsNone(capture.stream)
@@ -225,6 +277,83 @@ class InterfaceTests(unittest.TestCase):
         assert settings is not None
         self.assertEqual(len(self.window.spectra.curves[0].getData()[0]), settings.block_size // 2 + 1)
 
+    def test_spectrum_peak_hold_plots_unrendered_frequency_peaks(self) -> None:
+        settings = self.window.capture.settings
+        stream = self.window.capture.stream
+        analyzer = self.window.analyzer
+        assert settings is not None and stream is not None and analyzer is not None
+        phase = 2 * np.pi * np.arange(settings.block_size) / settings.block_size
+        first = np.column_stack((0.5 * np.sin(32 * phase), 0.25 * np.sin(64 * phase)))
+        later = np.column_stack((0.05 * np.sin(96 * phase), 0.1 * np.sin(128 * phase)))
+        stream.callback(first, settings.block_size, None, "")
+        stream.callback(later, settings.block_size, None, "")
+        self.window._update_measurement()
+        current = analyzer.analyze(later)
+        held = np.maximum(analyzer.analyze(first), current)
+        self.assertTrue(self.window.peak_hold_checkbox.isChecked())
+        for channel in range(settings.channels):
+            np.testing.assert_allclose(self.window.spectra.curves[channel].getData()[1], current[:, channel])
+            np.testing.assert_allclose(self.window.spectra.peak_curves[channel].getData()[1], held[:, channel])
+
+    def test_spectrum_peak_visibility_keeps_history_and_survives_restart(self) -> None:
+        self.push(0.5)
+        self.window.peak_hold_checkbox.setChecked(False)
+        self.push(0.25)
+        for curve in self.window.spectra.peak_curves:
+            self.assertFalse(curve.isVisible())
+            self.assertAlmostEqual(float(curve.getData()[1][0]), 20 * np.log10(0.5))
+        self.window.peak_hold_checkbox.setChecked(True)
+        for curve in self.window.spectra.peak_curves:
+            self.assertTrue(curve.isVisible())
+            self.assertAlmostEqual(float(curve.getData()[1][0]), 20 * np.log10(0.5))
+        self.window.peak_hold_checkbox.setChecked(False)
+        self.window.start_capture()
+        for curve in self.window.spectra.peak_curves:
+            self.assertFalse(curve.isVisible())
+            self.assertIsNone(curve.getData()[0])
+        self.window.peak_hold_checkbox.setChecked(True)
+        self.push(0.1)
+        for curve in self.window.spectra.peak_curves:
+            self.assertTrue(curve.isVisible())
+            self.assertAlmostEqual(float(curve.getData()[1][0]), 20 * np.log10(0.1))
+
+    def test_reset_peaks_resets_held_spectrum_while_stopped(self) -> None:
+        self.push(0.5)
+        self.push(0.25)
+        self.window._toggle_capture()
+        self.window.reset_button.click()
+        for current, held in zip(self.window.spectra.curves, self.window.spectra.peak_curves):
+            np.testing.assert_array_equal(held.getData()[1], current.getData()[1])
+            self.assertAlmostEqual(float(held.getData()[1][0]), 20 * np.log10(0.25))
+        self.assertEqual(self.window.elapsed_label.text(), "Measured 00:00:00")
+
+    def test_eight_channel_floor_peaks_remain_visible(self) -> None:
+        self.query.return_value = [justfan.InputDevice(3, "Eight-channel microphone", "Test API", 8, 48000, 0.01)]
+        self.window.refresh_devices()
+        settings = self.window.capture.settings
+        stream = self.window.capture.stream
+        assert settings is not None and stream is not None
+        signal = np.zeros((settings.block_size, 8))
+        phase = 2 * np.pi * np.arange(settings.block_size) / settings.block_size
+        signal[:, 0] = 0.5 * np.sin(32 * phase)
+        signal[:, 1] = 0.25 * np.sin(64 * phase)
+        stream.callback(signal, settings.block_size, None, "")
+        stream.callback(np.zeros_like(signal), settings.block_size, None, "")
+        self.window._update_measurement()
+        assert self.window.capture.buffer is not None
+        frame = self.window.capture.buffer.snapshot()
+        assert frame is not None and frame.spectrum_peaks is not None
+        self.assertEqual(len(self.window.spectra.peak_curves), 8)
+        for channel, held in enumerate(self.window.spectra.peak_curves):
+            with self.subTest(channel=channel + 1, check="data"):
+                self.assertTrue(held.isVisible())
+                np.testing.assert_array_equal(held.getData()[1], frame.spectrum_peaks[:, channel])
+            with self.subTest(channel=channel + 1, check="overlap"):
+                self.assertGreater(held.zValue(), self.window.spectra.curves[channel].zValue())
+                self.assertGreater(held.opts["pen"].widthF(), self.window.spectra.curves[channel].opts["pen"].widthF())
+            with self.subTest(channel=channel + 1, check="floor"):
+                self.assertLess(self.window.spectra.plots[channel].getViewBox().viewRange()[1][0], justfan.DB_FLOOR)
+
     def test_device_sorting_preserves_default_and_refresh_selection(self) -> None:
         devices = [
             justfan.InputDevice(12, "USB microphone", "Windows WASAPI", 2, 48000, 0.01),
@@ -252,11 +381,13 @@ class InterfaceTests(unittest.TestCase):
         self.assertTrue(previous.closed)
         self.assertEqual(len(self.window.channel_widgets), 1)
         self.assertEqual(len(self.window.spectra.curves), 1)
+        self.assertEqual(len(self.window.spectra.peak_curves), 1)
         self.assertEqual(self.window.channel_widgets[0].current_values[0].text(), "--")
         self.assertEqual(self.window.sample_rate.value(), 44100)
         self.assertEqual(self.window.channel_count.value(), 1)
         self.assertEqual(self.window.latency.value(), 20)
         self.assertIsNone(self.window.spectra.curves[0].getData()[0])
+        self.assertIsNone(self.window.spectra.peak_curves[0].getData()[0])
 
     def test_splitter_reflows_graphs_and_channel_values(self) -> None:
         assert self.application is not None
@@ -304,6 +435,7 @@ class InterfaceTests(unittest.TestCase):
             dialog.assert_not_called()
         self.assertEqual(self.window.channel_widgets, [])
         self.assertEqual(self.window.spectra.curves, [])
+        self.assertEqual(self.window.spectra.peak_curves, [])
         self.query.return_value = self.devices
         self.window.refresh_devices()
         self.assertTrue(self.window.start_button.isEnabled())

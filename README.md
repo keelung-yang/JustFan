@@ -62,8 +62,10 @@ press **Apply** to begin a new measurement. The driver validates the settings;
 not every combination is supported. Requested latency is a hint and may differ
 from actual driver latency. **Stop** freezes the display and releases the input;
 **Start** begins a fresh measurement. **Reset peaks** retains current readings
-while resetting peak levels and measured time. The refresh icon re-enumerates
-available devices and starts a new measurement on the selected device.
+while resetting peak levels, the held spectrum, and measured time. Held values
+restart from the current readings, including when capture is stopped. The refresh
+icon re-enumerates available devices and starts a new measurement on the selected
+device.
 
 Unsupported settings, missing devices, capture interruptions, and input
 overflows are reported in the window. After reconnecting a device, refresh the
@@ -88,8 +90,29 @@ values aligned left and measurement peaks aligned right.
 	amplitude is RMS dBFS per FFT bin with coherent-gain compensation; it is not
 	a power spectral density. Frequency resolution is sample rate / FFT size.
 
-The display floor is -120 dBFS. A full-scale sine wave has an RMS level near
--3.01 dBFS. These are digital levels, **not calibrated dB SPL**; microphone gain,
+Each plot overlays a solid **Current** spectrum and a dashed orange **Peak hold**
+spectrum. Peak hold stores the highest amplitude reached independently at every
+frequency bin since measurement start or the last reset, including audio blocks
+between display refreshes. Peaks at different frequencies may come from different
+times; this is not a frozen single-frame spectrum. Storage stays bounded to the
+current and held spectra rather than an audio history.
+
+The channel list's **Noise** peak is the highest whole-block RMS level, not the
+largest FFT-bin amplitude; these two measurements normally have different values.
+Every reported input channel has independent level and spectrum peaks. A driver's
+channel count does not guarantee a distinct active microphone on every channel:
+some routes may carry only silence or low-level noise.
+
+The **Peak hold** checkbox beside the spectrum heading shows or hides the overlay
+without discarding its history. **Reset peaks** resets both the noise-level peaks
+and held spectra. Starting capture, applying settings, refreshing devices, or
+changing devices starts new peak histories on the matching frequency grid.
+
+The display floor is -120 dBFS. The plot extends 5 dB below that floor, and held
+traces are drawn above current traces, so floor-level or overlapping peak traces
+remain visible. The extra axis margin does not change the calculated values.
+A full-scale sine wave has an RMS level near -3.01 dBFS. These are digital levels,
+**not calibrated dB SPL**; microphone gain,
 driver processing, and hardware all affect the readings. Measured time counts
 captured samples and excludes stopped time; an input overflow can lose samples.
 
