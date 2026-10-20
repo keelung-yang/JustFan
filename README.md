@@ -42,6 +42,45 @@ depend on the installed ALSA, PulseAudio, or PipeWire configuration. If Qt repor
 a missing display plugin dependency, install the corresponding Qt/XCB or Wayland
 runtime library for your distribution. Do not run the application as root.
 
+## Build A Windows Executable
+
+Using the Windows virtual environment from the setup instructions above:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install --upgrade pyinstaller
+.\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm JustFan.spec
+.\dist\JustFan.exe
+```
+
+`JustFan.spec` creates a single executable without a console window. PyInstaller's
+standard hooks collect PySide6/Qt, NumPy, pyqtgraph, and sounddevice's Windows
+PortAudio libraries. UPX compression is disabled. Intermediate files are written
+to `build/`; the executable is written to `dist/JustFan.exe`. Both output
+directories are ignored by Git.
+
+The executable icon comes from `JustFan.ico`. Its editable source is
+`JustFan.svg`; both files are retained in the repository.
+The ICO contains PNG-compressed images at 16, 24, 32, 48, 64, 128, and 256 pixels.
+
+If Explorer shows an old icon in Small icons, List, or Details view after a
+rebuild, first try `ie4uinit.exe -show` and press **F5** in that Explorer window. Windows
+can cache small icons separately from larger images. Temporarily renaming the
+executable is another way to check for a stale display cache. PyInstaller's
+`--clean` clears its build cache, not Windows Explorer's icon cache.
+
+If the wrong small icon persists, rebuild the Windows icon cache with Explorer
+stopped, then restart Explorer. The rebuildable files are
+`%LOCALAPPDATA%\IconCache.db` and
+`%LOCALAPPDATA%\Microsoft\Windows\Explorer\iconcache*.db`; do not remove other
+files in these directories. Restarting Explorer briefly hides the taskbar and
+may close folder windows, so finish file transfers first.
+
+The target Windows computer does not need Python installed, but still needs its
+audio drivers and microphone permissions. Build on Windows for Windows;
+PyInstaller is not a cross-compiler. The same spec can be used on Linux to build
+a native Linux executable, with the system audio and display libraries described
+above.
+
 ## Input And Capture
 
 JustFan selects the default input device and starts capture on launch. The input

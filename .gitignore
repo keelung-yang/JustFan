@@ -2,3 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
+
+# PyInstaller output
+/build/
+/dist/

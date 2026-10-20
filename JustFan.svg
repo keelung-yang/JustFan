@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="256" height="256" viewBox="0 0 256 256">
+  <title>JustFan</title>
+  <desc>A black computer cooling fan with seven swept blades, mounting holes, and a red thermometer.</desc>
+  <defs>
+    <linearGradient id="frame" x1="20" y1="12" x2="216" y2="228"
+                    gradientUnits="userSpaceOnUse">
+      <stop stop-color="#62666c"/>
+      <stop offset="0.3" stop-color="#35383d"/>
+      <stop offset="1" stop-color="#141619"/>
+    </linearGradient>
+    <linearGradient id="bladeSurface" x1="108" y1="42" x2="137" y2="113"
+                    gradientUnits="userSpaceOnUse">
+      <stop stop-color="#90959c"/>
+      <stop offset="0.4" stop-color="#55595f"/>
+      <stop offset="1" stop-color="#292c30"/>
+    </linearGradient>
+    <radialGradient id="hub" cx="0.35" cy="0.25" r="0.8">
+      <stop stop-color="#656a71"/>
+      <stop offset="0.5" stop-color="#35383d"/>
+      <stop offset="1" stop-color="#17191c"/>
+    </radialGradient>
+    <linearGradient id="thermometer" x1="210" y1="100" x2="239" y2="100"
+                    gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f5f6f8"/>
+      <stop offset="0.55" stop-color="#e0e3e7"/>
+      <stop offset="1" stop-color="#a3a8b0"/>
+    </linearGradient>
+    <g id="blade">
+      <path d="M108 103 C95 83 99 58 112 43 C124 38 139 42 148 49 L140 68 C133 84 132 96 129 108 L120 118 Z"
+            fill="url(#bladeSurface)" stroke="#101214" stroke-width="1.5"
+            stroke-linejoin="round"/>
+      <path d="M112 47 C103 62 103 80 111 95"
+            fill="none" stroke="#c0c4ca" stroke-width="1.5" opacity="0.55"/>
+    </g>
+    <g id="mount">
+      <circle r="8" fill="#08090a" stroke="#848990" stroke-width="2"/>
+      <circle r="4" fill="#16181b"/>
+    </g>
+  </defs>
+  <path d="M32 12 H208 L228 32 V208 L208 228 H32 L12 208 V32 Z"
+        fill="url(#frame)" stroke="#101113" stroke-width="4"/>
+  <path d="M38 23 H202 L217 38 V202 L202 217 H38 L23 202 V38 Z"
+        fill="none" stroke="#878c94" stroke-width="1.5" opacity="0.45"/>
+  <use xlink:href="#mount" transform="translate(35 35)"/>
+  <use xlink:href="#mount" transform="translate(205 35)"/>
+  <use xlink:href="#mount" transform="translate(35 205)"/>
+  <use xlink:href="#mount" transform="translate(205 205)"/>
+  <circle cx="120" cy="120" r="87"
+          fill="#070809" stroke="#767b83" stroke-width="3"/>
+  <circle cx="120" cy="120" r="82"
+          fill="#101214" stroke="#020303" stroke-width="4"/>
+  <path d="M120 120 L60 172 M120 120 L186 163 M120 120 L127 41"
+        fill="none" stroke="#2b2e33" stroke-width="7"/>
+  <use xlink:href="#blade"/>
+  <use xlink:href="#blade" transform="rotate(51.4286 120 120)"/>
+  <use xlink:href="#blade" transform="rotate(102.8571 120 120)"/>
+  <use xlink:href="#blade" transform="rotate(154.2857 120 120)"/>
+  <use xlink:href="#blade" transform="rotate(205.7143 120 120)"/>
+  <use xlink:href="#blade" transform="rotate(257.1429 120 120)"/>
+  <use xlink:href="#blade" transform="rotate(308.5714 120 120)"/>
+  <circle cx="120" cy="120" r="26"
+          fill="url(#hub)" stroke="#0a0b0c" stroke-width="4"/>
+  <circle cx="120" cy="120" r="18"
+          fill="#282b2f" stroke="#737981" stroke-width="1.5"/>
+  <circle cx="120" cy="120" r="5" fill="#9298a0"/>
+  <path d="M224 72 C216 72 210 78 210 86 V154 A25 25 0 1 0 238 154 V86 C238 78 232 72 224 72 Z"
+        fill="url(#thermometer)" stroke="#090a0b" stroke-width="7"
+        stroke-linejoin="round"/>
+  <path d="M231 105 H235 M231 122 H235 M231 139 H235"
+        fill="none" stroke="#777d85" stroke-width="2"/>
+  <path d="M224 96 V175" fill="none" stroke="#dd493c"
+        stroke-width="7" stroke-linecap="round"/>
+  <circle cx="224" cy="175" r="14" fill="#dd493c"/>
+</svg>
