@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from time import perf_counter
 from urllib.parse import quote
 
@@ -52,6 +52,7 @@ import pyqtgraph as pg
 
 VERSION = "1.1"
 DB_FLOOR = -120.0
+DEFAULT_MAX_CHANNELS = 8
 FFT_SIZES = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
 CHANNEL_COLORS = ("#087f8c", "#c75b39", "#5364ab", "#ac4271", "#56842e", "#a87516")
 
@@ -183,6 +184,8 @@ def query_input_devices() -> list[InputDevice]:
 
 
 class AudioCapture:
+	STOP_TIMEOUT = 0.5
+
 	def __init__(self) -> None:
 		self.stream: sd.InputStream | None = None
 		self.buffer: CaptureBuffer | None = None
@@ -228,13 +231,18 @@ class AudioCapture:
 	def stop(self) -> None:
 		stream, self.stream = self.stream, None
 		if stream is not None:
-			try:
+			def close_stream() -> None:
 				try:
-					stream.stop()
-				finally:
-					stream.close()
-			except sd.PortAudioError:
-				pass
+					try:
+						stream.stop()
+					finally:
+						stream.close()
+				except sd.PortAudioError:
+					pass
+
+			thread = Thread(target=close_stream, daemon=True)
+			thread.start()
+			thread.join(self.STOP_TIMEOUT)
 
 
 class FanIconAnimator(QObject):
@@ -436,11 +444,12 @@ class SpectrumPanel(QScrollArea):
 			plot.setLimits(xMin=0, xMax=sample_rate / 2, yMin=DB_FLOOR - 10, yMax=12)
 			plot.hideButtons()
 			plot.addLegend(offset=(-10, 10), labelTextSize="9pt")
-			curve = plot.plot(pen=pg.mkPen(color, width=1.5), name="Current")
+			curve = plot.plot(pen=pg.mkPen(color, width=0), name="Current", antialias=False)
 			curve.setZValue(1)
 			peak_curve = plot.plot(
-				pen=pg.mkPen("#b45f16", width=2.0, style=Qt.PenStyle.DashLine),
+				pen=pg.mkPen("#b45f16", width=1.0, style=Qt.PenStyle.DashLine),
 				name="Peak hold" if self._peak_hold_visible else None,
+				antialias=False,
 			)
 			peak_curve.setZValue(2)
 			for trace in (curve, peak_curve):
@@ -805,13 +814,14 @@ class MainWindow(QMainWindow):
 		if not isinstance(device, InputDevice):
 			return
 		self._stop_capture()
+		channels = min(device.channels, DEFAULT_MAX_CHANNELS)
 		self.sample_rate.setValue(device.sample_rate)
 		self.channel_count.setMaximum(device.channels)
-		self.channel_count.setValue(device.channels)
+		self.channel_count.setValue(channels)
 		block_size = min(FFT_SIZES[-1], max(FFT_SIZES[0], 2 ** round(math.log2(device.sample_rate * 0.05))))
 		self.fft_size.setCurrentIndex(self.fft_size.findData(block_size))
 		self.latency.setValue(max(0.1, device.latency * 1000))
-		self._show_channels(device.channels, device.sample_rate)
+		self._show_channels(channels, device.sample_rate)
 
 	def start_capture(self) -> None:
 		device = self.device_combo.currentData()
@@ -1043,7 +1053,7 @@ def configure_application(application: QApplication) -> None:
 		QToolButton { padding: 2px 6px; }
 		QStatusBar { background: #ffffff; border-top: 1px solid #d9e1e5; }
 	""")
-	pg.setConfigOptions(antialias=True, foreground="#46545d")
+	pg.setConfigOptions(antialias=False, foreground="#46545d")
 
 
 def main() -> int:

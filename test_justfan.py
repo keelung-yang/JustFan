@@ -7,6 +7,7 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 import runpy
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -203,6 +204,17 @@ class CaptureTests(unittest.TestCase):
             capture.stop()
         self.assertTrue(stream.closed)
         self.assertIsNone(capture.stream)
+
+    def test_stop_does_not_block_indefinitely_when_driver_hangs(self) -> None:
+        capture = justfan.AudioCapture()
+        stream = FakeStream(callback=lambda *_args: None)
+        capture.stream = stream
+        release = threading.Event()
+        self.addCleanup(release.set)
+        with patch.object(capture, "STOP_TIMEOUT", 0.02), patch.object(stream, "stop", side_effect=lambda: release.wait(1.0)):
+            capture.stop()
+        self.assertIsNone(capture.stream)
+        release.set()
 
 
 class PackagingTests(unittest.TestCase):
@@ -684,6 +696,14 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(self.window.latency.value(), 20)
         self.assertIsNone(self.window.spectra.curves[0].getData()[0])
         self.assertIsNone(self.window.spectra.peak_curves[0].getData()[0])
+
+    def test_virtual_device_caps_initial_channel_count(self) -> None:
+        self.query.return_value = [justfan.InputDevice(10, "default", "ALSA", 128, 48000, 0.01)]
+        self.window.refresh_devices()
+        self.assertEqual(self.window.channel_count.maximum(), 128)
+        self.assertEqual(self.window.channel_count.value(), justfan.DEFAULT_MAX_CHANNELS)
+        self.assertEqual(len(self.window.channel_widgets), justfan.DEFAULT_MAX_CHANNELS)
+        self.assertEqual(len(self.window.spectra.plots), justfan.DEFAULT_MAX_CHANNELS)
 
     def test_double_click_fills_spectrum_panel_and_restores_grid(self) -> None:
         assert self.application is not None
