@@ -4,6 +4,7 @@
 import math
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Lock
 from time import perf_counter
 from urllib.parse import quote
@@ -11,7 +12,7 @@ from urllib.parse import quote
 import numpy as np
 import sounddevice as sd
 from PySide6.QtCore import QByteArray, QEvent, QObject, QSettings, QSignalBlocker, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QMouseEvent, QPalette, QResizeEvent
+from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QIcon, QMouseEvent, QPalette, QResizeEvent
 from PySide6.QtWidgets import (
 	QAbstractItemView,
 	QApplication,
@@ -923,6 +924,7 @@ class MainWindow(QMainWindow):
 def configure_application(application: QApplication) -> None:
 	application.setApplicationName("JustFan")
 	application.setOrganizationName("JustFan")
+	application.setWindowIcon(QIcon(str(Path(__file__).with_name("JustFan.ico"))))
 	application.setStyle("Fusion")
 	application.setFont(QFont("Segoe UI" if sys.platform == "win32" else "Noto Sans", 10))
 	palette = QPalette()
