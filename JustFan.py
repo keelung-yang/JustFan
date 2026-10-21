@@ -810,7 +810,7 @@ class MainWindow(QMainWindow):
 		block_size = min(FFT_SIZES[-1], max(FFT_SIZES[0], 2 ** round(math.log2(device.sample_rate * 0.05))))
 		self.fft_size.setCurrentIndex(self.fft_size.findData(block_size))
 		self.latency.setValue(max(0.1, device.latency * 1000))
-		self.start_capture()
+		self._show_channels(device.channels, device.sample_rate)
 
 	def start_capture(self) -> None:
 		device = self.device_combo.currentData()

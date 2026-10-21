@@ -249,6 +249,16 @@ class InterfaceTests(unittest.TestCase):
         self.window.show()
         assert self.application is not None
         self.application.processEvents()
+        self.window.start_capture()
+
+    def test_initialization_does_not_start_capture(self) -> None:
+        with patch.object(justfan.AudioCapture, "start") as start:
+            window = justfan.MainWindow(self.settings)
+        self.addCleanup(window.close)
+        start.assert_not_called()
+        self.assertIsNone(window.capture.stream)
+        self.assertEqual(window.start_button.text(), "Start")
+        self.assertEqual(len(window.channel_widgets), 2)
 
     def test_windows_inherit_application_icon(self) -> None:
         assert self.application is not None
@@ -386,7 +396,7 @@ class InterfaceTests(unittest.TestCase):
         assert controls is not None
         control_layout = controls.layout()
         assert control_layout is not None
-        self.assertEqual(self.window.windowTitle(), "JustFan v1.0")
+        self.assertEqual(self.window.windowTitle(), f"JustFan v{justfan.VERSION}")
         self.assertFalse(any(label.text() == "JustFan" for label in controls.findChildren(QLabel)))
         self.assertEqual(control_layout.count(), 2)
         parameters = control_layout.itemAt(1).layout()
@@ -588,6 +598,7 @@ class InterfaceTests(unittest.TestCase):
     def test_eight_channel_floor_peaks_remain_visible(self) -> None:
         self.query.return_value = [justfan.InputDevice(3, "Eight-channel microphone", "Test API", 8, 48000, 0.01)]
         self.window.refresh_devices()
+        self.window.start_capture()
         settings = self.window.capture.settings
         stream = self.window.capture.stream
         assert settings is not None and stream is not None
@@ -621,6 +632,7 @@ class InterfaceTests(unittest.TestCase):
             justfan.InputDevice(11, "USB microphone", "MME", 2, 48000, 0.01),
         ]
         self.query.return_value = devices
+        self.check.reset_mock()
         self.window.refresh_devices()
         combo = self.window.device_combo
         self.assertEqual([combo.itemData(row).index for row in range(combo.count())], [6, 9, 3, 11, 12])
@@ -630,12 +642,12 @@ class InterfaceTests(unittest.TestCase):
         )
         self.assertEqual(combo.currentData().index, 3)
         self.assertEqual(combo.currentText(), f"3. {self.devices[0].label}")
-        self.assertEqual(self.check.call_args.kwargs["device"], 3)
+        self.check.assert_not_called()
         combo.setCurrentIndex(combo.findText(devices[0].label, Qt.MatchFlag.MatchEndsWith))
         self.window.refresh_devices()
         self.assertEqual(combo.currentData().index, 12)
         self.assertEqual(combo.currentText(), f"5. {devices[0].label}")
-        self.assertEqual(self.check.call_args.kwargs["device"], 12)
+        self.check.assert_not_called()
 
     def test_device_switch_clears_readings_and_queries_parameters(self) -> None:
         self.push()
