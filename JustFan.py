@@ -3,7 +3,9 @@
 
 import math
 import sys
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from threading import Lock
 from time import perf_counter
@@ -11,8 +13,9 @@ from urllib.parse import quote
 
 import numpy as np
 import sounddevice as sd
-from PySide6.QtCore import QByteArray, QEvent, QObject, QSettings, QSignalBlocker, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QIcon, QMouseEvent, QPalette, QResizeEvent
+from PySide6.QtCore import QByteArray, QEvent, QObject, QRectF, QSettings, QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QIcon, QImage, QMouseEvent, QPainter, QPalette, QPixmap, QResizeEvent
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
 	QAbstractItemView,
 	QApplication,
@@ -46,7 +49,7 @@ from PySide6.QtWidgets import (
 import pyqtgraph as pg
 
 
-VERSION = "1.0"
+VERSION = "1.1"
 DB_FLOOR = -120.0
 FFT_SIZES = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
 CHANNEL_COLORS = ("#087f8c", "#c75b39", "#5364ab", "#ac4271", "#56842e", "#a87516")
@@ -231,6 +234,86 @@ class AudioCapture:
 					stream.close()
 			except sd.PortAudioError:
 				pass
+
+
+class FanIconAnimator(QObject):
+	POSE_FRAMES = 8
+	SPIN_FRAMES = 12
+	SIZES = (16, 24, 32, 48, 64, 128, 256)
+	IDLE_TRANSFORM = (0.9, -0.15, 0.06, 0.92, 0.0, 34.0)
+	RUNNING_TRANSFORM = (0.92, 0.0, 0.0, 0.92, 4.8, 16.0)
+
+	def __init__(self, window: QMainWindow) -> None:
+		super().__init__(window)
+		self._window = window
+		self.idle_icon = QIcon(str(Path(__file__).with_name("JustFan.ico")))
+		self.frames = self._load_frames(Path(__file__).with_name("JustFan.svg"))
+		self.frame_index = 0
+		self.timer = QTimer(self)
+		self.timer.setInterval(50)
+		self.timer.setTimerType(Qt.TimerType.PreciseTimer)
+		self.timer.timeout.connect(self._advance)
+
+	@classmethod
+	@lru_cache(maxsize=1)
+	def _load_frames(cls, path: Path) -> tuple[QIcon, ...]:
+		try:
+			root = ET.parse(path).getroot()
+		except (OSError, ET.ParseError):
+			return ()
+		assembly = next((element for element in root.iter() if element.get("id") == "fanAssembly"), None)
+		blades = next((element for element in root.iter() if element.get("id") == "fanBlades"), None)
+		if assembly is None or blades is None:
+			return ()
+		ET.register_namespace("", "http://www.w3.org/2000/svg")
+		ET.register_namespace("xlink", "http://www.w3.org/1999/xlink")
+		frames = []
+		for frame in range(cls.POSE_FRAMES + cls.SPIN_FRAMES):
+			progress = min(frame, cls.POSE_FRAMES - 1) / (cls.POSE_FRAMES - 1)
+			progress = progress * progress * (3.0 - 2.0 * progress)
+			transform = [start + (end - start) * progress for start, end in zip(cls.IDLE_TRANSFORM, cls.RUNNING_TRANSFORM)]
+			assembly.set("transform", f"matrix({' '.join(f'{value:.6g}' for value in transform)})")
+			angle = max(0, frame - cls.POSE_FRAMES) * 360.0 / (7 * cls.SPIN_FRAMES)
+			blades.set("transform", f"rotate({angle:.6g} 120 120)")
+			renderer = QSvgRenderer(QByteArray(ET.tostring(root, encoding="utf-8")))
+			if not renderer.isValid():
+				return ()
+			icon = QIcon()
+			for size in cls.SIZES:
+				image = QImage(size, size, QImage.Format.Format_ARGB32)
+				image.fill(Qt.GlobalColor.transparent)
+				painter = QPainter(image)
+				try:
+					painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+					renderer.render(painter, QRectF(0, 0, size, size))
+				finally:
+					painter.end()
+				icon.addPixmap(QPixmap.fromImage(image))
+			frames.append(icon)
+		return tuple(frames)
+
+	def _show_icon(self, icon: QIcon) -> None:
+		QApplication.setWindowIcon(icon)
+		self._window.setWindowIcon(icon)
+
+	def set_running(self, running: bool) -> None:
+		if running and self.frames:
+			if not self.timer.isActive():
+				self.frame_index = 0
+				self._show_icon(self.frames[0])
+				self.timer.start()
+		else:
+			self.timer.stop()
+			self.frame_index = 0
+			self._show_icon(self.idle_icon)
+
+	def _advance(self) -> None:
+		if not self.timer.isActive() or not self.frames:
+			return
+		self.frame_index += 1
+		if self.frame_index >= len(self.frames):
+			self.frame_index = self.POSE_FRAMES
+		self._show_icon(self.frames[self.frame_index])
 
 
 class ChannelWidget(QFrame):
@@ -449,6 +532,7 @@ class MainWindow(QMainWindow):
 		super().__init__()
 		self.settings = settings if settings is not None else QSettings("JustFan", "JustFan")
 		self.capture = AudioCapture()
+		self.icon_animator = FanIconAnimator(self)
 		self.analyzer: SpectrumAnalyzer | None = None
 		self.channel_widgets: list[ChannelWidget] = []
 		self._disabled_channels: dict[tuple[str, str], set[int]] = {}
@@ -612,6 +696,7 @@ class MainWindow(QMainWindow):
 		self._set_running(False)
 
 	def _set_running(self, running: bool) -> None:
+		self.icon_animator.set_running(running)
 		self.start_button.setText("Stop" if running else "Start")
 		icon = QStyle.StandardPixmap.SP_MediaStop if running else QStyle.StandardPixmap.SP_MediaPlay
 		self.start_button.setIcon(self.style().standardIcon(icon))
@@ -915,6 +1000,7 @@ class MainWindow(QMainWindow):
 
 	def closeEvent(self, event: QCloseEvent) -> None:
 		self.timer.stop()
+		self.icon_animator.set_running(False)
 		self.capture.stop()
 		self.settings.setValue("window/geometry", self.saveGeometry())
 		self.settings.setValue("window/splitter", self.splitter.saveState())

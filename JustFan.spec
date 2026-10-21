@@ -6,7 +6,7 @@ project_root = Path(SPECPATH)
 analysis = Analysis(
     [str(project_root / "JustFan.py")],
     pathex=[str(project_root)],
-    datas=[(str(project_root / "JustFan.ico"), ".")],
+    datas=[(str(project_root / "JustFan.ico"), "."), (str(project_root / "JustFan.svg"), ".")],
     excludes=["PyQt5", "PyQt6", "PySide2"],
 )
 archive = PYZ(analysis.pure)

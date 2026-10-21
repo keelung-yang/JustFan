@@ -4,13 +4,16 @@ import os
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
+import runpy
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
-from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtCore import QSettings, QSize, Qt, QTimer
+from PySide6.QtGui import QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QDialogButtonBox, QLabel, QLineEdit, QStackedWidget, QTableWidget, QWidget
 
@@ -201,6 +204,26 @@ class CaptureTests(unittest.TestCase):
         self.assertIsNone(capture.stream)
 
 
+class PackagingTests(unittest.TestCase):
+    def test_runtime_window_icon_is_included_in_bundle(self) -> None:
+        project_root = Path(justfan.__file__).resolve().parent
+        build_analysis = Mock(return_value=SimpleNamespace(pure=[], scripts=[], binaries=[], datas=[]))
+        build_executable = Mock()
+        runpy.run_path(
+            str(project_root / "JustFan.spec"),
+            init_globals={
+                "SPECPATH": str(project_root),
+                "Analysis": build_analysis,
+                "PYZ": Mock(),
+                "EXE": build_executable,
+            },
+        )
+        icon_path = str(project_root / "JustFan.ico")
+        self.assertIn((icon_path, "."), build_analysis.call_args.kwargs.get("datas", []))
+        self.assertIn((str(project_root / "JustFan.svg"), "."), build_analysis.call_args.kwargs.get("datas", []))
+        self.assertEqual(build_executable.call_args.kwargs["icon"], icon_path)
+
+
 class InterfaceTests(unittest.TestCase):
     application = None
 
@@ -226,6 +249,95 @@ class InterfaceTests(unittest.TestCase):
         self.window.show()
         assert self.application is not None
         self.application.processEvents()
+
+    def test_windows_inherit_application_icon(self) -> None:
+        assert self.application is not None
+        icon = self.application.windowIcon()
+        self.assertFalse(icon.isNull())
+        self.assertEqual(self.window.windowIcon().cacheKey(), icon.cacheKey())
+        dialog = QDialog(self.window)
+        self.addCleanup(dialog.close)
+        self.assertEqual(dialog.windowIcon().cacheKey(), icon.cacheKey())
+        sizes = {(size.width(), size.height()) for size in icon.availableSizes()}
+        for size in (16, 24, 32, 48, 64, 128, 256):
+            with self.subTest(size=size):
+                self.assertIn((size, size), sizes)
+                self.assertFalse(self.window.windowIcon().pixmap(size, size).isNull())
+
+    def test_application_icon_loads_from_bundle_outside_working_directory(self) -> None:
+        assert self.application is not None
+        bundle = Path(self.directory.name) / "bundle"
+        bundle.mkdir()
+        icon = bundle / "JustFan.ico"
+        icon.write_bytes(Path(justfan.__file__).with_name("JustFan.ico").read_bytes())
+        self.addCleanup(justfan.configure_application, self.application)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.directory.name)
+        with patch.object(justfan, "__file__", str(bundle / "JustFan.py")):
+            justfan.configure_application(self.application)
+            self.assertFalse(self.application.windowIcon().isNull())
+            self.assertFalse(self.window.windowIcon().pixmap(24, 24).isNull())
+
+    def test_icon_straightens_rotates_and_restores_idle_on_stop(self) -> None:
+        assert self.application is not None
+        animator = self.window.icon_animator
+        frames = animator.frames
+        self.assertTrue(animator.timer.isActive())
+        self.window._stop_capture()
+        self.assertFalse(animator.timer.isActive())
+        self.assertEqual(self.window.windowIcon().cacheKey(), animator.idle_icon.cacheKey())
+        self.window.start_capture()
+        self.assertTrue(animator.timer.isActive())
+        self.assertIs(animator.frames, frames)
+        images = []
+        for _step in range(animator.POSE_FRAMES + 3):
+            images.append(self.window.windowIcon().pixmap(QSize(32, 32), 1.0).toImage())
+            animator._advance()
+        self.assertNotEqual(images[0], images[animator.POSE_FRAMES - 1])
+        self.assertNotEqual(images[animator.POSE_FRAMES], images[animator.POSE_FRAMES + 1])
+        for _step in range(len(frames) * 2):
+            animator._advance()
+        self.assertGreaterEqual(animator.frame_index, animator.POSE_FRAMES)
+        self.assertLess(animator.frame_index, len(frames))
+        self.window._stop_capture()
+        self.assertEqual(self.application.windowIcon().cacheKey(), animator.idle_icon.cacheKey())
+        animator._advance()
+        self.assertEqual(self.application.windowIcon().cacheKey(), animator.idle_icon.cacheKey())
+
+    def test_running_icon_rotates_only_blades(self) -> None:
+        animator = self.window.icon_animator
+        images = [
+            icon.pixmap(QSize(256, 256), 1.0).toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+            for icon in animator.frames[animator.POSE_FRAMES:animator.POSE_FRAMES + 2]
+        ]
+        pixels = [np.frombuffer(image.constBits(), dtype=np.uint8).copy().reshape(256, 256, 4) for image in images]
+        changed = np.any(pixels[0] != pixels[1], axis=2)
+        rows, columns = np.ogrid[:256, :256]
+        radius = np.hypot((columns + 0.5 - 4.8) / 0.92 - 120, (rows + 0.5 - 16) / 0.92 - 120)
+        self.assertTrue(np.any(changed))
+        self.assertFalse(np.any(changed[radius > 82]))
+        self.assertFalse(np.any(changed[radius < 22]))
+
+    def test_icon_animation_stops_after_failure_disconnect_and_close(self) -> None:
+        animator = self.window.icon_animator
+        self.check.side_effect = justfan.sd.PortAudioError("Unsupported sample rate")
+        self.window.start_capture()
+        self.assertFalse(animator.timer.isActive())
+        self.assertEqual(self.window.windowIcon().cacheKey(), animator.idle_icon.cacheKey())
+        self.check.side_effect = None
+        self.window.start_capture()
+        self.assertTrue(animator.timer.isActive())
+        stream = self.window.capture.stream
+        assert stream is not None
+        stream.active = False
+        self.window._update_measurement()
+        self.assertFalse(animator.timer.isActive())
+        self.assertEqual(self.window.windowIcon().cacheKey(), animator.idle_icon.cacheKey())
+        self.window.start_capture()
+        self.assertTrue(animator.timer.isActive())
+        self.window.close()
+        self.assertFalse(animator.timer.isActive())
+        self.assertEqual(self.window.windowIcon().cacheKey(), animator.idle_icon.cacheKey())
 
     def push(self, amplitude: float = 0.25) -> None:
         settings = self.window.capture.settings

@@ -2,7 +2,7 @@
      xmlns:xlink="http://www.w3.org/1999/xlink"
      width="256" height="256" viewBox="0 0 256 256">
   <title>JustFan</title>
-  <desc>A black computer cooling fan with seven swept blades, mounting holes, and a red thermometer.</desc>
+      <desc>A tilted black computer cooling fan with seven silver-gray blades, a raised frame, and an upright red thermometer.</desc>
   <defs>
     <linearGradient id="frame" x1="20" y1="12" x2="216" y2="228"
                     gradientUnits="userSpaceOnUse">
@@ -10,11 +10,17 @@
       <stop offset="0.3" stop-color="#35383d"/>
       <stop offset="1" stop-color="#141619"/>
     </linearGradient>
+            <linearGradient id="frameSide" x1="18" y1="210" x2="238" y2="130"
+                                                            gradientUnits="userSpaceOnUse">
+                  <stop stop-color="#20252b"/>
+                  <stop offset="0.7" stop-color="#434b55"/>
+                  <stop offset="1" stop-color="#707b87"/>
+            </linearGradient>
     <linearGradient id="bladeSurface" x1="108" y1="42" x2="137" y2="113"
                     gradientUnits="userSpaceOnUse">
-      <stop stop-color="#90959c"/>
-      <stop offset="0.4" stop-color="#55595f"/>
-      <stop offset="1" stop-color="#292c30"/>
+                  <stop stop-color="#e4e8ec"/>
+                  <stop offset="0.55" stop-color="#b4bbc3"/>
+                  <stop offset="1" stop-color="#737d87"/>
     </linearGradient>
     <radialGradient id="hub" cx="0.35" cy="0.25" r="0.8">
       <stop stop-color="#656a71"/>
@@ -32,39 +38,52 @@
             fill="url(#bladeSurface)" stroke="#101214" stroke-width="1.5"
             stroke-linejoin="round"/>
       <path d="M112 47 C103 62 103 80 111 95"
-            fill="none" stroke="#c0c4ca" stroke-width="1.5" opacity="0.55"/>
+            fill="none" stroke="#f1f3f6" stroke-width="2" opacity="0.8"/>
     </g>
     <g id="mount">
       <circle r="8" fill="#08090a" stroke="#848990" stroke-width="2"/>
       <circle r="4" fill="#16181b"/>
     </g>
   </defs>
-  <path d="M32 12 H208 L228 32 V208 L208 228 H32 L12 208 V32 Z"
-        fill="url(#frame)" stroke="#101113" stroke-width="4"/>
-  <path d="M38 23 H202 L217 38 V202 L202 217 H38 L23 202 V38 Z"
-        fill="none" stroke="#878c94" stroke-width="1.5" opacity="0.45"/>
-  <use xlink:href="#mount" transform="translate(35 35)"/>
-  <use xlink:href="#mount" transform="translate(205 35)"/>
-  <use xlink:href="#mount" transform="translate(35 205)"/>
-  <use xlink:href="#mount" transform="translate(205 205)"/>
-  <circle cx="120" cy="120" r="87"
-          fill="#070809" stroke="#767b83" stroke-width="3"/>
-  <circle cx="120" cy="120" r="82"
-          fill="#101214" stroke="#020303" stroke-width="4"/>
-  <path d="M120 120 L60 172 M120 120 L186 163 M120 120 L127 41"
-        fill="none" stroke="#2b2e33" stroke-width="7"/>
-  <use xlink:href="#blade"/>
-  <use xlink:href="#blade" transform="rotate(51.4286 120 120)"/>
-  <use xlink:href="#blade" transform="rotate(102.8571 120 120)"/>
-  <use xlink:href="#blade" transform="rotate(154.2857 120 120)"/>
-  <use xlink:href="#blade" transform="rotate(205.7143 120 120)"/>
-  <use xlink:href="#blade" transform="rotate(257.1429 120 120)"/>
-  <use xlink:href="#blade" transform="rotate(308.5714 120 120)"/>
-  <circle cx="120" cy="120" r="26"
-          fill="url(#hub)" stroke="#0a0b0c" stroke-width="4"/>
-  <circle cx="120" cy="120" r="18"
-          fill="#282b2f" stroke="#737981" stroke-width="1.5"/>
-  <circle cx="120" cy="120" r="5" fill="#9298a0"/>
+  <g id="fanAssembly" transform="matrix(0.9 -0.15 0.06 0.92 0 34)">
+    <path d="M42 20 H218 L238 40 V216 L218 236 H42 L22 216 V40 Z"
+          fill="url(#frameSide)" stroke="#101113" stroke-width="4"
+          stroke-linejoin="round"/>
+    <path d="M208 12 L228 32 V208 L208 228 L218 236 L238 216 V40 L218 20 Z"
+          fill="url(#frameSide)" stroke="#101113" stroke-width="2"
+          stroke-linejoin="round"/>
+    <path d="M12 208 L32 228 H208 L218 236 H42 L22 216 Z"
+          fill="#252a30" stroke="#101113" stroke-width="2"
+          stroke-linejoin="round"/>
+    <path d="M32 12 H208 L228 32 V208 L208 228 H32 L12 208 V32 Z"
+          fill="url(#frame)" stroke="#101113" stroke-width="4"/>
+    <path d="M38 23 H202 L217 38 V202 L202 217 H38 L23 202 V38 Z"
+          fill="none" stroke="#878c94" stroke-width="1.5" opacity="0.45"/>
+    <use xlink:href="#mount" transform="translate(35 35)"/>
+    <use xlink:href="#mount" transform="translate(205 35)"/>
+    <use xlink:href="#mount" transform="translate(35 205)"/>
+    <use xlink:href="#mount" transform="translate(205 205)"/>
+    <circle cx="120" cy="120" r="87"
+            fill="#070809" stroke="#767b83" stroke-width="3"/>
+    <circle cx="120" cy="120" r="82"
+            fill="#101214" stroke="#020303" stroke-width="4"/>
+    <path d="M120 120 L60 172 M120 120 L186 163 M120 120 L127 41"
+          fill="none" stroke="#2b2e33" stroke-width="7"/>
+            <g id="fanBlades">
+                  <use xlink:href="#blade"/>
+                  <use xlink:href="#blade" transform="rotate(51.4286 120 120)"/>
+                  <use xlink:href="#blade" transform="rotate(102.8571 120 120)"/>
+                  <use xlink:href="#blade" transform="rotate(154.2857 120 120)"/>
+                  <use xlink:href="#blade" transform="rotate(205.7143 120 120)"/>
+                  <use xlink:href="#blade" transform="rotate(257.1429 120 120)"/>
+                  <use xlink:href="#blade" transform="rotate(308.5714 120 120)"/>
+            </g>
+    <circle cx="120" cy="120" r="26"
+            fill="url(#hub)" stroke="#0a0b0c" stroke-width="4"/>
+    <circle cx="120" cy="120" r="18"
+            fill="#282b2f" stroke="#737981" stroke-width="1.5"/>
+    <circle cx="120" cy="120" r="5" fill="#9298a0"/>
+  </g>
   <path d="M224 72 C216 72 210 78 210 86 V154 A25 25 0 1 0 238 154 V86 C238 78 232 72 224 72 Z"
         fill="url(#thermometer)" stroke="#090a0b" stroke-width="7"
         stroke-linejoin="round"/>
