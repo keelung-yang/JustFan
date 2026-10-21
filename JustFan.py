@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-platform microphone, temperature, and fan monitoring."""
+"""Cross-platform cooling fan noise measurement and calibration utility."""
 
 import math
 import signal
@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (
 import pyqtgraph as pg
 
 
-VERSION = "1.1"
+VERSION = "1.2"
 DB_FLOOR = -120.0
 DEFAULT_MAX_CHANNELS = 8
 FFT_SIZES = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
@@ -399,6 +399,7 @@ class SpectrumPanel(QScrollArea):
 		self._focused_plot: pg.PlotWidget | None = None
 		self.columns = 0
 		self._empty: QLabel | None = None
+		self.frequency_range = (0, 10_000)
 		self.setWidgetResizable(True)
 		self.setFrameShape(QFrame.Shape.NoFrame)
 		self.content = QWidget()
@@ -439,7 +440,11 @@ class SpectrumPanel(QScrollArea):
 			plot.setLabel("bottom", "Frequency", units="Hz")
 			plot.setLabel("left", "RMS amplitude", units="dBFS")
 			plot.showGrid(x=True, y=True, alpha=0.15)
-			plot.setXRange(0, sample_rate / 2, padding=0)
+			plot.setXRange(
+				min(self.frequency_range[0], sample_rate / 2 - 1),
+				min(self.frequency_range[1], sample_rate / 2),
+				padding=0,
+			)
 			plot.setYRange(DB_FLOOR - 5, 0, padding=0)
 			plot.setLimits(xMin=0, xMax=sample_rate / 2, yMin=DB_FLOOR - 10, yMax=12)
 			plot.hideButtons()
@@ -460,6 +465,11 @@ class SpectrumPanel(QScrollArea):
 			self.curves.append(curve)
 			self.peak_curves.append(peak_curve)
 		self._reflow()
+
+	def set_frequency_range(self, minimum: int, maximum: int) -> None:
+		self.frequency_range = (minimum, maximum)
+		for plot in self.plots:
+			plot.setXRange(minimum, maximum, padding=0)
 
 	def set_channel_enabled(self, channel: int, enabled: bool) -> None:
 		if not 0 <= channel < len(self.plots) or self._enabled_channels[channel] == enabled:
@@ -688,6 +698,21 @@ class MainWindow(QMainWindow):
 		chart_heading = QHBoxLayout()
 		chart_heading.setContentsMargins(12, 12, 12, 0)
 		chart_heading.addWidget(QLabel("Noise spectrum"))
+		chart_heading.addWidget(QLabel("Range"))
+		maximum_frequency = int(self.sample_rate.maximum() / 2)
+		self.frequency_minimum = QSpinBox()
+		self.frequency_minimum.setRange(0, maximum_frequency - 1)
+		self.frequency_minimum.setValue(0)
+		self.frequency_minimum.setSuffix(" Hz")
+		self.frequency_minimum.setToolTip("Minimum frequency shown in the spectrum.")
+		chart_heading.addWidget(self.frequency_minimum)
+		chart_heading.addWidget(QLabel("to"))
+		self.frequency_maximum = QSpinBox()
+		self.frequency_maximum.setRange(1, maximum_frequency)
+		self.frequency_maximum.setValue(10_000)
+		self.frequency_maximum.setSuffix(" Hz")
+		self.frequency_maximum.setToolTip("Maximum frequency shown in the spectrum.")
+		chart_heading.addWidget(self.frequency_maximum)
 		chart_heading.addStretch()
 		self.peak_hold_checkbox = QCheckBox("Peak hold")
 		self.peak_hold_checkbox.setChecked(True)
@@ -696,6 +721,8 @@ class MainWindow(QMainWindow):
 		right_layout.addLayout(chart_heading)
 		self.spectra = SpectrumPanel()
 		self.peak_hold_checkbox.toggled.connect(self.spectra.set_peak_hold_visible)
+		self.frequency_minimum.valueChanged.connect(self._frequency_minimum_changed)
+		self.frequency_maximum.valueChanged.connect(self._frequency_maximum_changed)
 		right_layout.addWidget(self.spectra)
 		self.splitter.addWidget(left)
 		self.splitter.addWidget(right)
@@ -719,6 +746,16 @@ class MainWindow(QMainWindow):
 		self.start_button.setText("Stop" if running else "Start")
 		icon = QStyle.StandardPixmap.SP_MediaStop if running else QStyle.StandardPixmap.SP_MediaPlay
 		self.start_button.setIcon(self.style().standardIcon(icon))
+
+	def _frequency_minimum_changed(self, minimum: int) -> None:
+		if minimum >= self.frequency_maximum.value():
+			self.frequency_maximum.setValue(minimum + 1)
+		self.spectra.set_frequency_range(minimum, self.frequency_maximum.value())
+
+	def _frequency_maximum_changed(self, maximum: int) -> None:
+		if maximum <= self.frequency_minimum.value():
+			self.frequency_minimum.setValue(maximum - 1)
+		self.spectra.set_frequency_range(self.frequency_minimum.value(), maximum)
 
 	def _reset_fps(self) -> None:
 		self._fps_frames = 0
@@ -750,6 +787,11 @@ class MainWindow(QMainWindow):
 		self.spectra.set_channel_enabled(channel, enabled)
 
 	def _show_channels(self, count: int, sample_rate: float) -> None:
+		nyquist = int(sample_rate / 2)
+		self.frequency_maximum.setMaximum(nyquist)
+		self.frequency_minimum.setMaximum(max(0, nyquist - 1))
+		if self.frequency_minimum.value() >= self.frequency_maximum.value():
+			self.frequency_minimum.setValue(max(0, self.frequency_maximum.value() - 1))
 		device = self.device_combo.currentData()
 		disabled_channels = self._disabled_channels.get((device.host_api, device.name), set()) if isinstance(device, InputDevice) else set()
 		while self.channel_layout.count():

@@ -388,6 +388,30 @@ class InterfaceTests(unittest.TestCase):
         stream.callback(np.full((settings.block_size, settings.channels), amplitude), settings.block_size, None, "")
         self.window._update_measurement()
 
+    def test_spectrum_defaults_to_frequency_range_up_to_10_khz(self) -> None:
+        self.assertEqual(self.window.spectra.plots[0].getViewBox().viewRange()[0], [0, 10_000])
+
+    def test_spectrum_default_frequency_range_is_capped_at_nyquist(self) -> None:
+        panel = justfan.SpectrumPanel()
+        self.addCleanup(panel.close)
+        panel.set_channels(1, 16000)
+        self.assertEqual(panel.plots[0].getViewBox().viewRange()[0], [0, 8000])
+
+    def test_frequency_range_controls_update_all_spectra(self) -> None:
+        self.window.frequency_minimum.setValue(1000)
+        self.window.frequency_maximum.setValue(8000)
+        self.assertEqual(self.window.spectra.frequency_range, (1000, 8000))
+        for plot in self.window.spectra.plots:
+            self.assertEqual(plot.getViewBox().viewRange()[0], [1000, 8000])
+
+    def test_frequency_range_controls_are_capped_by_device_nyquist(self) -> None:
+        self.window.frequency_maximum.setValue(30_000)
+        self.window.device_combo.setCurrentIndex(
+            self.window.device_combo.findText(self.devices[1].label, Qt.MatchFlag.MatchEndsWith)
+        )
+        self.assertEqual(self.window.frequency_maximum.value(), 22_050)
+        self.assertEqual(self.window.spectra.plots[0].getViewBox().viewRange()[0][1], 22_050)
+
     def test_fps_counts_only_new_display_frames_and_handles_no_new_audio(self) -> None:
         self.assertLess(self.window.fps_label.x(), self.window.elapsed_label.x())
         self.assertLessEqual(self.window.fps_label.geometry().right(), self.window.elapsed_label.x())
@@ -472,7 +496,9 @@ class InterfaceTests(unittest.TestCase):
                 self.assertEqual(label.text(), "--")
         settings = self.window.capture.settings
         assert settings is not None
-        self.assertEqual(len(self.window.spectra.curves[0].getData()[0]), settings.block_size // 2 + 1)
+        frequencies = self.window.spectra.curves[0].getData()[0]
+        self.assertGreater(len(frequencies), 0)
+        self.assertLessEqual(frequencies[-1], 10_000 + settings.sample_rate / settings.block_size)
 
     def test_channel_checkbox_hides_spectrum_without_losing_readings(self) -> None:
         assert self.application is not None
@@ -599,8 +625,13 @@ class InterfaceTests(unittest.TestCase):
         held = np.maximum(analyzer.analyze(first), current)
         self.assertTrue(self.window.peak_hold_checkbox.isChecked())
         for channel in range(settings.channels):
-            np.testing.assert_allclose(self.window.spectra.curves[channel].getData()[1], current[:, channel])
-            np.testing.assert_allclose(self.window.spectra.peak_curves[channel].getData()[1], held[:, channel])
+            for curve, expected in (
+                (self.window.spectra.curves[channel], current[:, channel]),
+                (self.window.spectra.peak_curves[channel], held[:, channel]),
+            ):
+                frequencies, levels = curve.getData()
+                indices = np.searchsorted(analyzer.frequencies, frequencies)
+                np.testing.assert_allclose(levels, expected[indices])
 
     def test_spectrum_peak_visibility_keeps_history_and_survives_restart(self) -> None:
         self.push(0.5)
@@ -640,7 +671,8 @@ class InterfaceTests(unittest.TestCase):
         self.window.start_capture()
         settings = self.window.capture.settings
         stream = self.window.capture.stream
-        assert settings is not None and stream is not None
+        analyzer = self.window.analyzer
+        assert settings is not None and stream is not None and analyzer is not None
         signal = np.zeros((settings.block_size, 8))
         phase = 2 * np.pi * np.arange(settings.block_size) / settings.block_size
         signal[:, 0] = 0.5 * np.sin(32 * phase)
@@ -655,7 +687,9 @@ class InterfaceTests(unittest.TestCase):
         for channel, held in enumerate(self.window.spectra.peak_curves):
             with self.subTest(channel=channel + 1, check="data"):
                 self.assertTrue(held.isVisible())
-                np.testing.assert_array_equal(held.getData()[1], frame.spectrum_peaks[:, channel])
+                frequencies, levels = held.getData()
+                indices = np.searchsorted(analyzer.frequencies, frequencies)
+                np.testing.assert_array_equal(levels, frame.spectrum_peaks[indices, channel])
             with self.subTest(channel=channel + 1, check="overlap"):
                 self.assertGreater(held.zValue(), self.window.spectra.curves[channel].zValue())
                 self.assertGreater(held.opts["pen"].widthF(), self.window.spectra.curves[channel].opts["pen"].widthF())
