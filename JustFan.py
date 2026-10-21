@@ -432,7 +432,7 @@ class SpectrumPanel(QScrollArea):
 		for channel in range(count):
 			plot = pg.PlotWidget(background="w")
 			plot.viewport().installEventFilter(self)
-			plot.setMinimumSize(300, 250)
+			plot.setMinimumSize(300, 180)
 			plot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 			color = CHANNEL_COLORS[channel % len(CHANNEL_COLORS)]
 			plot.setTitle(f"Channel {channel + 1:02d}", color=color, size="11pt")
@@ -498,10 +498,18 @@ class SpectrumPanel(QScrollArea):
 	def _reflow(self) -> None:
 		if not self.plots:
 			return
+		self.content.setMinimumHeight(self.viewport().height())
 		enabled_plots = [plot for plot, enabled in zip(self.plots, self._enabled_channels) if enabled]
 		plots = [self._focused_plot] if self._focused_plot is not None else enabled_plots
-		available = max(1, self.viewport().width() - 24)
-		columns = 1 if self._focused_plot is not None else max(1, min(len(plots), (available + 12) // 372))
+		available_width = max(1, self.viewport().width() - 24)
+		available_height = max(1, self.viewport().height() - 20)
+		max_columns = max(1, (available_width + 12) // 312)
+		aspect_ratio = available_width / available_height
+		columns = 1 if self._focused_plot is not None or not plots else min(
+			len(plots),
+			max_columns,
+			max(1, round(math.sqrt(len(plots) * aspect_ratio / 1.5))),
+		)
 		if columns == self.columns:
 			return
 		while self.grid.count():
@@ -524,7 +532,8 @@ class SpectrumPanel(QScrollArea):
 			plot.setVisible(self._enabled_channels[channel] and (self._focused_plot is None or plot is self._focused_plot))
 		for column in range(columns):
 			self.grid.setColumnStretch(column, 1)
-		self.grid.setRowStretch(0 if self._focused_plot is not None else math.ceil(len(plots) / columns), 1)
+		for row in range(math.ceil(len(plots) / columns)):
+			self.grid.setRowStretch(row, 1)
 		self.columns = columns
 
 	def resizeEvent(self, event: QResizeEvent) -> None:

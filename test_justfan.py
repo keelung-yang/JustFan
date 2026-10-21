@@ -799,6 +799,22 @@ class InterfaceTests(unittest.TestCase):
             for label in widget.current_values + widget.peak_values:
                 self.assertGreaterEqual(label.width(), label.fontMetrics().horizontalAdvance(label.text()))
 
+    def test_four_spectra_use_balanced_rows_and_fill_available_height(self) -> None:
+        assert self.application is not None
+        self.query.return_value = [justfan.InputDevice(3, "Four-channel microphone", "Test API", 4, 48000, 0.01)]
+        self.window.refresh_devices()
+        self.window.resize(1360, 680)
+        self.window.splitter.setSizes([350, 1000])
+        self.application.processEvents()
+        panel = self.window.spectra
+        self.assertEqual(panel.columns, 2)
+        self.assertEqual(
+            [panel.grid.getItemPosition(panel.grid.indexOf(plot))[:2] for plot in panel.plots],
+            [(0, 0), (0, 1), (1, 0), (1, 1)],
+        )
+        self.assertGreater(panel.plots[2].geometry().height(), 180)
+        self.assertFalse(panel.verticalScrollBar().isVisible())
+
     def test_edit_apply_stop_and_reset(self) -> None:
         self.window.sample_rate.setValue(32000)
         self.window.channel_count.setValue(1)
