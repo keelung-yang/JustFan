@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import numpy as np
 from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QDialogButtonBox, QLabel, QLineEdit, QStackedWidget, QTableWidget, QWidget
 
 import JustFan as justfan
@@ -423,6 +424,80 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(self.window.latency.value(), 20)
         self.assertIsNone(self.window.spectra.curves[0].getData()[0])
         self.assertIsNone(self.window.spectra.peak_curves[0].getData()[0])
+
+    def test_double_click_fills_spectrum_panel_and_restores_grid(self) -> None:
+        assert self.application is not None
+        panel = self.window.spectra
+        plot = panel.plots[1]
+        curves = list(panel.curves)
+        self.push(0.5)
+        QTest.mouseDClick(plot.viewport(), Qt.MouseButton.LeftButton, pos=plot.viewport().rect().center())
+        self.application.processEvents()
+        self.assertEqual([item.isVisible() for item in panel.plots], [False, True])
+        self.assertEqual(panel.grid.count(), 1)
+        self.assertEqual(plot.geometry(), panel.viewport().rect().marginsRemoved(panel.grid.contentsMargins()))
+        self.assertEqual(panel.curves, curves)
+        self.push(0.25)
+        QTest.mouseDClick(plot.viewport(), Qt.MouseButton.LeftButton, pos=plot.viewport().rect().center())
+        self.application.processEvents()
+        self.assertTrue(all(item.isVisible() for item in panel.plots))
+        self.assertEqual(panel.grid.count(), 2)
+        for current, held in zip(panel.curves, panel.peak_curves):
+            self.assertAlmostEqual(float(current.getData()[1][0]), 20 * np.log10(0.25))
+            self.assertAlmostEqual(float(held.getData()[1][0]), 20 * np.log10(0.5))
+
+    def test_focused_spectrum_fills_panel_after_scrolling_and_resizing(self) -> None:
+        assert self.application is not None
+        self.query.return_value = [justfan.InputDevice(3, "Eight-channel microphone", "Test API", 8, 48000, 0.01)]
+        self.window.refresh_devices()
+        self.application.processEvents()
+        panel = self.window.spectra
+        panel.verticalScrollBar().setValue(panel.verticalScrollBar().maximum())
+        plot = panel.plots[-1]
+        QTest.mouseDClick(plot.viewport(), Qt.MouseButton.LeftButton, pos=plot.viewport().rect().center())
+        self.application.processEvents()
+        for width, sizes in ((1360, [300, 1050]), (860, [500, 360]), (1500, [350, 1150])):
+            with self.subTest(width=width):
+                self.window.resize(width, 680)
+                self.window.splitter.setSizes(sizes)
+                self.application.processEvents()
+                self.assertEqual(panel.columns, 1)
+                self.assertEqual(panel.grid.count(), 1)
+                self.assertEqual([item.isVisible() for item in panel.plots], [False] * 7 + [True])
+                self.assertFalse(panel.verticalScrollBar().isVisible())
+                self.assertFalse(panel.horizontalScrollBar().isVisible())
+                self.assertEqual(plot.geometry(), panel.viewport().rect().marginsRemoved(panel.grid.contentsMargins()))
+        QTest.mouseDClick(plot.viewport(), Qt.MouseButton.LeftButton, pos=plot.viewport().rect().center())
+        self.application.processEvents()
+        self.assertTrue(all(item.isVisible() for item in panel.plots))
+        self.assertEqual(panel.grid.getItemPosition(panel.grid.indexOf(plot))[:2], (7 // panel.columns, 7 % panel.columns))
+
+    def test_rebuilding_channels_clears_focused_spectrum(self) -> None:
+        assert self.application is not None
+        panel = self.window.spectra
+        plot = panel.plots[1]
+        QTest.mouseDClick(plot.viewport(), Qt.MouseButton.LeftButton, pos=plot.viewport().rect().center())
+        self.window.device_combo.setCurrentIndex(self.window.device_combo.findText(self.devices[1].label))
+        self.application.processEvents()
+        self.assertIsNone(panel._focused_plot)
+        self.assertEqual(len(panel.plots), 1)
+        self.assertTrue(panel.plots[0].isVisible())
+        plot = panel.plots[0]
+        QTest.mouseDClick(plot.viewport(), Qt.MouseButton.LeftButton, pos=plot.viewport().rect().center())
+        self.application.processEvents()
+        self.assertEqual(plot.geometry(), panel.viewport().rect().marginsRemoved(panel.grid.contentsMargins()))
+        self.query.return_value = []
+        self.window.refresh_devices()
+        self.application.processEvents()
+        self.assertIsNone(panel._focused_plot)
+        self.assertEqual(panel.plots, [])
+        self.assertEqual(panel.grid.count(), 1)
+        self.assertEqual(panel.grid.itemAt(0).widget().text(), "No spectrum data")
+        self.query.return_value = self.devices
+        self.window.refresh_devices()
+        self.application.processEvents()
+        self.assertEqual(len(panel.plots), 2)
+        self.assertTrue(all(item.isVisible() for item in panel.plots))
 
     def test_splitter_reflows_graphs_and_channel_values(self) -> None:
         assert self.application is not None

@@ -10,8 +10,8 @@ from urllib.parse import quote
 
 import numpy as np
 import sounddevice as sd
-from PySide6.QtCore import QByteArray, QSettings, QSignalBlocker, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QPalette, QResizeEvent
+from PySide6.QtCore import QByteArray, QEvent, QObject, QSettings, QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QMouseEvent, QPalette, QResizeEvent
 from PySide6.QtWidgets import (
 	QAbstractItemView,
 	QApplication,
@@ -295,6 +295,7 @@ class SpectrumPanel(QScrollArea):
 		self.curves = []
 		self.peak_curves = []
 		self._peak_hold_visible = True
+		self._focused_plot: pg.PlotWidget | None = None
 		self.columns = 0
 		self._empty: QLabel | None = None
 		self.setWidgetResizable(True)
@@ -306,6 +307,11 @@ class SpectrumPanel(QScrollArea):
 		self.setWidget(self.content)
 
 	def set_channels(self, count: int, sample_rate: float) -> None:
+		self._focused_plot = None
+		for plot in self.plots:
+			self.grid.removeWidget(plot)
+			plot.hide()
+			plot.deleteLater()
 		while self.grid.count():
 			item = self.grid.takeAt(0)
 			widget = item.widget()
@@ -323,6 +329,7 @@ class SpectrumPanel(QScrollArea):
 			return
 		for channel in range(count):
 			plot = pg.PlotWidget(background="w")
+			plot.viewport().installEventFilter(self)
 			plot.setMinimumSize(300, 250)
 			plot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 			color = CHANNEL_COLORS[channel % len(CHANNEL_COLORS)]
@@ -362,11 +369,26 @@ class SpectrumPanel(QScrollArea):
 			else:
 				plot.plotItem.legend.removeItem(curve)
 
+	def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+		if (
+			event.type() == QEvent.Type.MouseButtonDblClick
+			and isinstance(event, QMouseEvent)
+			and event.button() == Qt.MouseButton.LeftButton
+		):
+			for plot in self.plots:
+				if watched is plot.viewport():
+					self._focused_plot = None if self._focused_plot is plot else plot
+					self.columns = 0
+					self._reflow()
+					return True
+		return super().eventFilter(watched, event)
+
 	def _reflow(self) -> None:
 		if not self.plots:
 			return
+		plots = [self._focused_plot] if self._focused_plot is not None else self.plots
 		available = max(1, self.viewport().width() - 24)
-		columns = max(1, min(len(self.plots), (available + 12) // 372))
+		columns = 1 if self._focused_plot is not None else max(1, min(len(plots), (available + 12) // 372))
 		if columns == self.columns:
 			return
 		while self.grid.count():
@@ -375,11 +397,13 @@ class SpectrumPanel(QScrollArea):
 			self.grid.setColumnStretch(column, 0)
 		for row in range(self.grid.rowCount()):
 			self.grid.setRowStretch(row, 0)
-		for index, plot in enumerate(self.plots):
+		for index, plot in enumerate(plots):
 			self.grid.addWidget(plot, index // columns, index % columns)
+		for plot in self.plots:
+			plot.setVisible(self._focused_plot is None or plot is self._focused_plot)
 		for column in range(columns):
 			self.grid.setColumnStretch(column, 1)
-		self.grid.setRowStretch(math.ceil(len(self.plots) / columns), 1)
+		self.grid.setRowStretch(0 if self._focused_plot is not None else math.ceil(len(plots) / columns), 1)
 		self.columns = columns
 
 	def resizeEvent(self, event: QResizeEvent) -> None:
