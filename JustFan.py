@@ -234,6 +234,7 @@ class AudioCapture:
 
 class ChannelWidget(QFrame):
 	sensor_commands_requested = Signal(int)
+	enabled_changed = Signal(int, bool)
 
 	def __init__(self, channel: int, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
@@ -244,15 +245,18 @@ class ChannelWidget(QFrame):
 		layout.setContentsMargins(12, 12, 12, 12)
 		layout.setHorizontalSpacing(12)
 		layout.setVerticalSpacing(10)
-		heading = QLabel(f"Channel {channel + 1:02d}")
-		heading.setStyleSheet(f"color: {CHANNEL_COLORS[channel % len(CHANNEL_COLORS)]}; font-weight: 600;")
+		self.enabled_checkbox = QCheckBox(f"Channel {channel + 1:02d}")
+		self.enabled_checkbox.setChecked(True)
+		self.enabled_checkbox.setStyleSheet(f"color: {CHANNEL_COLORS[channel % len(CHANNEL_COLORS)]}; font-weight: 600;")
+		self.enabled_checkbox.setToolTip("Show this channel in the noise spectrum.")
+		self.enabled_checkbox.toggled.connect(self._request_enabled_change)
 		self.commands_button = QToolButton()
 		self.commands_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
 		self.commands_button.setToolTip(f"Configure Channel {channel + 1:02d} sensor commands")
 		self.commands_button.setAccessibleName(f"Configure Channel {channel + 1:02d} sensor commands")
 		self.commands_button.clicked.connect(self._request_sensor_commands)
 		header = QHBoxLayout()
-		header.addWidget(heading)
+		header.addWidget(self.enabled_checkbox)
 		header.addStretch()
 		header.addWidget(self.commands_button)
 		layout.addLayout(header, 0, 0)
@@ -283,6 +287,9 @@ class ChannelWidget(QFrame):
 	def _request_sensor_commands(self) -> None:
 		self.sensor_commands_requested.emit(self._channel)
 
+	def _request_enabled_change(self, enabled: bool) -> None:
+		self.enabled_changed.emit(self._channel, enabled)
+
 	def update_levels(self, current: float, peak: float) -> None:
 		self.current_values[0].setText(f"{current:.1f}")
 		self.peak_values[0].setText(f"{peak:.1f}")
@@ -295,6 +302,7 @@ class SpectrumPanel(QScrollArea):
 		self.curves = []
 		self.peak_curves = []
 		self._peak_hold_visible = True
+		self._enabled_channels: list[bool] = []
 		self._focused_plot: pg.PlotWidget | None = None
 		self.columns = 0
 		self._empty: QLabel | None = None
@@ -320,6 +328,7 @@ class SpectrumPanel(QScrollArea):
 		self.plots.clear()
 		self.curves.clear()
 		self.peak_curves.clear()
+		self._enabled_channels = [True] * count
 		self.columns = 0
 		self._empty = None
 		if not count:
@@ -358,6 +367,15 @@ class SpectrumPanel(QScrollArea):
 			self.peak_curves.append(peak_curve)
 		self._reflow()
 
+	def set_channel_enabled(self, channel: int, enabled: bool) -> None:
+		if not 0 <= channel < len(self.plots) or self._enabled_channels[channel] == enabled:
+			return
+		self._enabled_channels[channel] = enabled
+		if not enabled and self._focused_plot is self.plots[channel]:
+			self._focused_plot = None
+		self.columns = 0
+		self._reflow()
+
 	def set_peak_hold_visible(self, visible: bool) -> None:
 		if visible == self._peak_hold_visible:
 			return
@@ -375,8 +393,8 @@ class SpectrumPanel(QScrollArea):
 			and isinstance(event, QMouseEvent)
 			and event.button() == Qt.MouseButton.LeftButton
 		):
-			for plot in self.plots:
-				if watched is plot.viewport():
+			for channel, plot in enumerate(self.plots):
+				if watched is plot.viewport() and self._enabled_channels[channel]:
 					self._focused_plot = None if self._focused_plot is plot else plot
 					self.columns = 0
 					self._reflow()
@@ -386,21 +404,30 @@ class SpectrumPanel(QScrollArea):
 	def _reflow(self) -> None:
 		if not self.plots:
 			return
-		plots = [self._focused_plot] if self._focused_plot is not None else self.plots
+		enabled_plots = [plot for plot, enabled in zip(self.plots, self._enabled_channels) if enabled]
+		plots = [self._focused_plot] if self._focused_plot is not None else enabled_plots
 		available = max(1, self.viewport().width() - 24)
 		columns = 1 if self._focused_plot is not None else max(1, min(len(plots), (available + 12) // 372))
 		if columns == self.columns:
 			return
 		while self.grid.count():
 			self.grid.takeAt(0)
+		if self._empty is not None:
+			self._empty.hide()
+			self._empty.deleteLater()
+			self._empty = None
 		for column in range(self.grid.columnCount()):
 			self.grid.setColumnStretch(column, 0)
 		for row in range(self.grid.rowCount()):
 			self.grid.setRowStretch(row, 0)
 		for index, plot in enumerate(plots):
 			self.grid.addWidget(plot, index // columns, index % columns)
-		for plot in self.plots:
-			plot.setVisible(self._focused_plot is None or plot is self._focused_plot)
+		if not plots:
+			self._empty = QLabel("No channels enabled")
+			self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+			self.grid.addWidget(self._empty, 0, 0)
+		for channel, plot in enumerate(self.plots):
+			plot.setVisible(self._enabled_channels[channel] and (self._focused_plot is None or plot is self._focused_plot))
 		for column in range(columns):
 			self.grid.setColumnStretch(column, 1)
 		self.grid.setRowStretch(0 if self._focused_plot is not None else math.ceil(len(plots) / columns), 1)
@@ -423,6 +450,7 @@ class MainWindow(QMainWindow):
 		self.capture = AudioCapture()
 		self.analyzer: SpectrumAnalyzer | None = None
 		self.channel_widgets: list[ChannelWidget] = []
+		self._disabled_channels: dict[tuple[str, str], set[int]] = {}
 		self._last_frames = -1
 		self._last_warning = ""
 		self._fps_frames = 0
@@ -605,7 +633,20 @@ class MainWindow(QMainWindow):
 		self.notice.setText(message)
 		self.notice.setVisible(bool(message))
 
+	def _set_channel_enabled(self, channel: int, enabled: bool) -> None:
+		device = self.device_combo.currentData()
+		if not isinstance(device, InputDevice):
+			return
+		disabled_channels = self._disabled_channels.setdefault((device.host_api, device.name), set())
+		if enabled:
+			disabled_channels.discard(channel)
+		else:
+			disabled_channels.add(channel)
+		self.spectra.set_channel_enabled(channel, enabled)
+
 	def _show_channels(self, count: int, sample_rate: float) -> None:
+		device = self.device_combo.currentData()
+		disabled_channels = self._disabled_channels.get((device.host_api, device.name), set()) if isinstance(device, InputDevice) else set()
 		while self.channel_layout.count():
 			item = self.channel_layout.takeAt(0)
 			widget = item.widget()
@@ -614,6 +655,8 @@ class MainWindow(QMainWindow):
 		self.channel_widgets.clear()
 		for channel in range(count):
 			widget = ChannelWidget(channel)
+			widget.enabled_checkbox.setChecked(channel not in disabled_channels)
+			widget.enabled_changed.connect(self._set_channel_enabled)
 			widget.sensor_commands_requested.connect(self._configure_commands)
 			self.channel_layout.addWidget(widget)
 			self.channel_widgets.append(widget)
@@ -627,6 +670,8 @@ class MainWindow(QMainWindow):
 		self.channel_layout.addStretch()
 		self.channel_label.setText(str(count))
 		self.spectra.set_channels(count, sample_rate)
+		for channel in disabled_channels:
+			self.spectra.set_channel_enabled(channel, False)
 		self.elapsed_label.setText("Measured 00:00:00")
 		self._last_frames = -1
 		self._last_warning = ""

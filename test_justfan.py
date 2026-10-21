@@ -313,6 +313,116 @@ class InterfaceTests(unittest.TestCase):
         assert settings is not None
         self.assertEqual(len(self.window.spectra.curves[0].getData()[0]), settings.block_size // 2 + 1)
 
+    def test_channel_checkbox_hides_spectrum_without_losing_readings(self) -> None:
+        assert self.application is not None
+        panel = self.window.spectra
+        stream = self.window.capture.stream
+        curves = list(panel.curves)
+        checkbox = self.window.channel_widgets[0].enabled_checkbox
+        self.assertTrue(all(widget.enabled_checkbox.isChecked() for widget in self.window.channel_widgets))
+        self.push(0.5)
+        checkbox.click()
+        self.application.processEvents()
+        self.assertFalse(checkbox.isChecked())
+        self.assertTrue(checkbox.isVisible())
+        self.assertTrue(checkbox.isEnabled())
+        self.assertEqual([plot.isVisible() for plot in panel.plots], [False, True])
+        self.assertEqual(panel.grid.count(), 1)
+        self.assertEqual(panel.grid.indexOf(panel.plots[0]), -1)
+        self.assertIs(panel.grid.itemAtPosition(0, 0).widget(), panel.plots[1])
+        self.push(0.75)
+        self.push(0.25)
+        self.assertEqual(self.window.channel_widgets[0].current_values[0].text(), "-12.0")
+        self.assertEqual(self.window.channel_widgets[0].peak_values[0].text(), "-2.5")
+        checkbox.click()
+        self.application.processEvents()
+        self.assertTrue(all(plot.isVisible() for plot in panel.plots))
+        self.assertEqual(panel.grid.count(), 2)
+        self.assertEqual(panel.curves, curves)
+        self.assertIs(self.window.capture.stream, stream)
+        for current, held in zip(panel.curves, panel.peak_curves):
+            self.assertAlmostEqual(float(current.getData()[1][0]), 20 * np.log10(0.25))
+            self.assertAlmostEqual(float(held.getData()[1][0]), 20 * np.log10(0.75))
+
+    def test_all_channels_can_be_disabled_and_reenabled(self) -> None:
+        assert self.application is not None
+        panel = self.window.spectra
+        for widget in self.window.channel_widgets:
+            widget.enabled_checkbox.click()
+        self.application.processEvents()
+        self.assertFalse(any(plot.isVisible() for plot in panel.plots))
+        self.assertEqual(panel.grid.count(), 1)
+        self.assertEqual(panel.grid.itemAt(0).widget().text(), "No channels enabled")
+        self.push()
+        self.window.channel_widgets[1].enabled_checkbox.click()
+        self.application.processEvents()
+        self.assertIsNone(panel._empty)
+        self.assertEqual(panel.grid.count(), 1)
+        self.assertIs(panel.grid.itemAtPosition(0, 0).widget(), panel.plots[1])
+        self.assertEqual([plot.isVisible() for plot in panel.plots], [False, True])
+        self.window.channel_widgets[0].enabled_checkbox.click()
+        self.application.processEvents()
+        self.assertTrue(all(plot.isVisible() for plot in panel.plots))
+        self.assertEqual(panel.grid.count(), 2)
+
+    def test_channel_filter_reflows_in_channel_order_across_resizes(self) -> None:
+        assert self.application is not None
+        self.query.return_value = [justfan.InputDevice(3, "Eight-channel microphone", "Test API", 8, 48000, 0.01)]
+        self.window.refresh_devices()
+        panel = self.window.spectra
+        enabled_channels = (1, 4, 7)
+        for channel, widget in enumerate(self.window.channel_widgets):
+            widget.enabled_checkbox.setChecked(channel in enabled_channels)
+        for width, sizes in ((1360, [350, 1000]), (860, [500, 360]), (1500, [350, 1150])):
+            with self.subTest(width=width):
+                self.window.resize(width, 680)
+                self.window.splitter.setSizes(sizes)
+                self.application.processEvents()
+                self.assertEqual(panel.grid.count(), len(enabled_channels))
+                self.assertEqual([plot.isVisible() for plot in panel.plots], [channel in enabled_channels for channel in range(8)])
+                for index, channel in enumerate(enabled_channels):
+                    self.assertEqual(panel.grid.getItemPosition(panel.grid.indexOf(panel.plots[channel]))[:2], divmod(index, panel.columns))
+                self.assertFalse(panel.horizontalScrollBar().isVisible())
+
+    def test_channel_filter_cooperates_with_spectrum_focus(self) -> None:
+        assert self.application is not None
+        panel = self.window.spectra
+        plot = panel.plots[1]
+        self.window.channel_widgets[0].enabled_checkbox.click()
+        for focused in (True, False):
+            QTest.mouseDClick(plot.viewport(), Qt.MouseButton.LeftButton, pos=plot.viewport().rect().center())
+            self.application.processEvents()
+            self.assertIs(panel._focused_plot, plot if focused else None)
+            self.assertEqual([item.isVisible() for item in panel.plots], [False, True])
+            self.assertEqual(panel.grid.count(), 1)
+        self.window.channel_widgets[0].enabled_checkbox.click()
+        QTest.mouseDClick(plot.viewport(), Qt.MouseButton.LeftButton, pos=plot.viewport().rect().center())
+        self.application.processEvents()
+        self.window.channel_widgets[1].enabled_checkbox.click()
+        self.application.processEvents()
+        self.assertIsNone(panel._focused_plot)
+        self.assertEqual([item.isVisible() for item in panel.plots], [True, False])
+        self.assertEqual(panel.grid.count(), 1)
+        self.assertIs(panel.grid.itemAtPosition(0, 0).widget(), panel.plots[0])
+
+    def test_channel_selection_survives_restart_and_is_device_specific(self) -> None:
+        self.window.channel_widgets[1].enabled_checkbox.click()
+        self.window.start_capture()
+        self.assertEqual([widget.enabled_checkbox.isChecked() for widget in self.window.channel_widgets], [True, False])
+        self.assertEqual([plot.isHidden() for plot in self.window.spectra.plots], [False, True])
+        self.window.device_combo.setCurrentIndex(self.window.device_combo.findText(self.devices[1].label, Qt.MatchFlag.MatchEndsWith))
+        self.assertTrue(self.window.channel_widgets[0].enabled_checkbox.isChecked())
+        self.window.channel_widgets[0].enabled_checkbox.click()
+        self.window.device_combo.setCurrentIndex(self.window.device_combo.findText(self.devices[0].label, Qt.MatchFlag.MatchEndsWith))
+        self.assertEqual([widget.enabled_checkbox.isChecked() for widget in self.window.channel_widgets], [True, False])
+        self.window.channel_count.setValue(1)
+        self.window.start_capture()
+        self.assertTrue(self.window.channel_widgets[0].enabled_checkbox.isChecked())
+        self.window.channel_count.setValue(2)
+        self.window.start_capture()
+        self.assertFalse(self.window.channel_widgets[1].enabled_checkbox.isChecked())
+        self.assertTrue(self.window.spectra.plots[1].isHidden())
+
     def test_spectrum_peak_hold_plots_unrendered_frequency_peaks(self) -> None:
         settings = self.window.capture.settings
         stream = self.window.capture.stream
