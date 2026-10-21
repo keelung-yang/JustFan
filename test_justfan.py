@@ -1,6 +1,7 @@
 """Deterministic signal and offscreen UI tests; no microphone is opened."""
 
 import os
+import signal
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
@@ -259,6 +260,25 @@ class InterfaceTests(unittest.TestCase):
         self.assertIsNone(window.capture.stream)
         self.assertEqual(window.start_button.text(), "Start")
         self.assertEqual(len(window.channel_widgets), 2)
+
+    def test_ctrl_c_closes_window_and_restores_signal_handler(self) -> None:
+        assert self.application is not None
+        previous_handler = signal.getsignal(signal.SIGINT)
+        QTimer.singleShot(50, lambda: signal.raise_signal(signal.SIGINT))
+        timeout = QTimer(self.window)
+        timeout.setSingleShot(True)
+        timeout.timeout.connect(self.application.quit)
+        timeout.start(2000)
+        with (
+            patch.object(justfan, "QApplication", return_value=self.application),
+            patch.object(justfan, "configure_application"),
+            patch.object(justfan, "MainWindow", return_value=self.window),
+        ):
+            self.assertEqual(justfan.main(), 0)
+        timeout.stop()
+        self.assertFalse(self.window.isVisible())
+        self.assertIsNone(self.window.capture.stream)
+        self.assertIs(signal.getsignal(signal.SIGINT), previous_handler)
 
     def test_windows_inherit_application_icon(self) -> None:
         assert self.application is not None

@@ -2,6 +2,7 @@
 """Cross-platform microphone, temperature, and fan monitoring."""
 
 import math
+import signal
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -1050,7 +1051,16 @@ def main() -> int:
 	configure_application(application)
 	window = MainWindow()
 	window.show()
-	return application.exec()
+	interrupt_timer = QTimer()
+	interrupt_timer.setInterval(500)
+	interrupt_timer.timeout.connect(lambda: None)
+	interrupt_timer.start()
+	previous_handler = signal.signal(signal.SIGINT, lambda _signum, _frame: window.close())
+	try:
+		return application.exec()
+	finally:
+		interrupt_timer.stop()
+		signal.signal(signal.SIGINT, previous_handler)
 
 
 if __name__ == "__main__":
