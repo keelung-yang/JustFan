@@ -1,14 +1,14 @@
 # JustFan
 
-JustFan aims to help monitor, control, and calibrate your PC’s cooling system.
 
-Noise is the top priority:
+The NOISE is the top priority:
 > A PC should keep quiet when it's idle.
 >
 > The NOISE is acceptable during work.
 >
-> Thus, you can think at your PC without its noise getting in the way.
+> Thus, you can think at your PC without NOISE.
 
+The JustFan aims to help monitor, control, and calibrate your PC’s cooling system.
 
 ## Features
 
