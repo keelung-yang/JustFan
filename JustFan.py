@@ -650,7 +650,7 @@ class MainWindow(QMainWindow):
 		with QSignalBlocker(self.device_combo):
 			self.device_combo.clear()
 			for row, device in enumerate(devices):
-				self.device_combo.addItem(device.label, device)
+				self.device_combo.addItem(f"{row + 1}. {device.label}", device)
 				if device.index == selected_index:
 					selected_row = row
 			if devices:

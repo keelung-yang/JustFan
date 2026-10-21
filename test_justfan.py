@@ -402,18 +402,24 @@ class InterfaceTests(unittest.TestCase):
         self.window.refresh_devices()
         combo = self.window.device_combo
         self.assertEqual([combo.itemData(row).index for row in range(combo.count())], [6, 9, 3, 11, 12])
+        self.assertEqual(
+            [combo.itemText(row) for row in range(combo.count())],
+            [f"{row + 1}. {combo.itemData(row).label}" for row in range(combo.count())],
+        )
         self.assertEqual(combo.currentData().index, 3)
+        self.assertEqual(combo.currentText(), f"3. {self.devices[0].label}")
         self.assertEqual(self.check.call_args.kwargs["device"], 3)
-        combo.setCurrentIndex(combo.findText(devices[0].label))
+        combo.setCurrentIndex(combo.findText(devices[0].label, Qt.MatchFlag.MatchEndsWith))
         self.window.refresh_devices()
         self.assertEqual(combo.currentData().index, 12)
+        self.assertEqual(combo.currentText(), f"5. {devices[0].label}")
         self.assertEqual(self.check.call_args.kwargs["device"], 12)
 
     def test_device_switch_clears_readings_and_queries_parameters(self) -> None:
         self.push()
         previous = self.window.capture.stream
         assert previous is not None
-        self.window.device_combo.setCurrentIndex(self.window.device_combo.findText(self.devices[1].label))
+        self.window.device_combo.setCurrentIndex(self.window.device_combo.findText(self.devices[1].label, Qt.MatchFlag.MatchEndsWith))
         self.assertTrue(previous.closed)
         self.assertEqual(len(self.window.channel_widgets), 1)
         self.assertEqual(len(self.window.spectra.curves), 1)
@@ -477,7 +483,7 @@ class InterfaceTests(unittest.TestCase):
         panel = self.window.spectra
         plot = panel.plots[1]
         QTest.mouseDClick(plot.viewport(), Qt.MouseButton.LeftButton, pos=plot.viewport().rect().center())
-        self.window.device_combo.setCurrentIndex(self.window.device_combo.findText(self.devices[1].label))
+        self.window.device_combo.setCurrentIndex(self.window.device_combo.findText(self.devices[1].label, Qt.MatchFlag.MatchEndsWith))
         self.application.processEvents()
         self.assertIsNone(panel._focused_plot)
         self.assertEqual(len(panel.plots), 1)
@@ -745,7 +751,7 @@ class InterfaceTests(unittest.TestCase):
         stereo_prefix = "commands/devices/Test%20API/Stereo%20microphone/channels/1"
         self.settings.setValue(f"{stereo_prefix}/temperature", "stereo-temperature")
         self.settings.setValue(f"{stereo_prefix}/speed", "stereo-speed")
-        self.window.device_combo.setCurrentIndex(self.window.device_combo.findText(self.devices[1].label))
+        self.window.device_combo.setCurrentIndex(self.window.device_combo.findText(self.devices[1].label, Qt.MatchFlag.MatchEndsWith))
 
         def save_mono_commands(dialog: QDialog) -> None:
             channel_combo, temperature, speed = self.command_fields(dialog)
@@ -762,7 +768,7 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(self.settings.value(f"{mono_prefix}/speed"), "mono-speed")
         self.query.return_value = [justfan.InputDevice(33, "Stereo microphone", "Test API", 2, 48000, 0.01), self.devices[1]]
         self.window.refresh_devices()
-        self.window.device_combo.setCurrentIndex(self.window.device_combo.findText(self.devices[0].label))
+        self.window.device_combo.setCurrentIndex(self.window.device_combo.findText(self.devices[0].label, Qt.MatchFlag.MatchEndsWith))
 
         def check_stereo_commands(dialog: QDialog) -> None:
             _, temperature, speed = self.command_fields(dialog)
