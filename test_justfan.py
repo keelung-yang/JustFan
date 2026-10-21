@@ -405,14 +405,21 @@ class InterfaceTests(unittest.TestCase):
             self.window._update_measurement()
             self.assertEqual(self.window.fps_label.text(), "FPS 0.0")
 
-    def test_fps_resets_on_stop_restart_and_missing_device(self) -> None:
+    def test_fps_is_preserved_on_stop_and_reset_on_restart(self) -> None:
         with patch.object(justfan, "perf_counter", return_value=100.0) as clock:
             self.window.start_capture()
             clock.return_value = 101.0
             self.push()
             self.assertEqual(self.window.fps_label.text(), "FPS 1.0")
+            settings = self.window.capture.settings
+            assert settings is not None
+            for _ in range((int(settings.sample_rate) + settings.block_size - 1) // settings.block_size - 1):
+                self.push()
+            elapsed = self.window.elapsed_label.text()
+            self.assertEqual(elapsed, "Measured 00:00:01")
             self.window._toggle_capture()
-            self.assertEqual(self.window.fps_label.text(), "FPS 0.0")
+            self.assertEqual(self.window.fps_label.text(), "FPS 1.0")
+            self.assertEqual(self.window.elapsed_label.text(), elapsed)
             clock.return_value = 102.0
             self.window._toggle_capture()
             self.assertEqual(self.window.fps_label.text(), "FPS 0.0")
@@ -421,7 +428,7 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual(self.window.fps_label.text(), "FPS 1.0")
             self.query.return_value = []
             self.window.refresh_devices()
-            self.assertEqual(self.window.fps_label.text(), "FPS 0.0")
+            self.assertEqual(self.window.fps_label.text(), "FPS 1.0")
 
     def test_compact_controls_remove_duplicate_title_and_reuse_parameter_row(self) -> None:
         controls = self.window.findChild(QWidget, "controls")

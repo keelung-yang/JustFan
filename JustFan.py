@@ -851,7 +851,6 @@ class MainWindow(QMainWindow):
 
 	def _stop_capture(self) -> None:
 		self.capture.stop()
-		self._reset_fps()
 		self._set_running(False)
 		self.state_label.setText("Stopped")
 
