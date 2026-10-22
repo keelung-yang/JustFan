@@ -16,7 +16,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import soundfile as sf
 from PySide6.QtCore import QSettings, QSize, Qt, QTimer
-from PySide6.QtGui import QImage, QPixmapCache
+from PySide6.QtGui import QColor, QImage, QPainter, QPixmapCache
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QDialogButtonBox, QGraphicsItem, QLabel, QLineEdit, QStackedWidget, QTableWidget, QWidget
 
@@ -539,6 +539,154 @@ class PackagingTests(unittest.TestCase):
         self.assertIn((icon_path, "."), build_analysis.call_args.kwargs.get("datas", []))
         self.assertIn((str(project_root / "JustFan.svg"), "."), build_analysis.call_args.kwargs.get("datas", []))
         self.assertEqual(build_executable.call_args.kwargs["icon"], icon_path)
+
+
+class LevelMeterTests(unittest.TestCase):
+    application = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+        assert isinstance(cls.application, QApplication)
+        justfan.configure_application(cls.application)
+
+    def setUp(self) -> None:
+        self.meter = justfan.LevelMeter(justfan.CHANNEL_COLORS[2])
+        self.meter.resize(240, 40)
+        self.addCleanup(self.meter.close)
+
+    def render_meter(self) -> QImage:
+        image = QImage(self.meter.size(), QImage.Format.Format_ARGB32)
+        image.fill(Qt.GlobalColor.transparent)
+        self.meter.render(image)
+        return image
+
+    def test_empty_and_silent_meter(self) -> None:
+        background = self.meter.palette().color(justfan.QPalette.ColorRole.AlternateBase)
+        marker = self.meter.palette().color(justfan.QPalette.ColorRole.WindowText)
+        row = self.meter.height() - 6
+        image = self.render_meter()
+        self.assertIsNone(self.meter.current)
+        self.assertIsNone(self.meter.peak)
+        for position in (0, 120, 239):
+            self.assertEqual(image.pixelColor(position, row), background)
+        self.meter.set_levels(justfan.DB_FLOOR, justfan.DB_FLOOR)
+        image = self.render_meter()
+        self.assertEqual(image.pixelColor(0, row), marker)
+        self.assertEqual(image.pixelColor(2, row), background)
+
+    def test_current_fill_and_peak_marker_share_dbfs_scale(self) -> None:
+        fill = QColor(justfan.CHANNEL_COLORS[2])
+        background = self.meter.palette().color(justfan.QPalette.ColorRole.AlternateBase)
+        marker = self.meter.palette().color(justfan.QPalette.ColorRole.WindowText)
+        row = self.meter.height() - 6
+        for current, endpoint in ((-60.0, 120), (-90.0, 60)):
+            with self.subTest(current=current):
+                self.meter.set_levels(current, -30.0)
+                image = self.render_meter()
+                self.assertEqual(image.pixelColor(endpoint - 1, row), fill)
+                self.assertEqual(image.pixelColor(endpoint, row), background)
+                self.assertEqual(image.pixelColor(179, row), marker)
+                self.assertEqual(image.pixelColor(180, row), marker)
+                self.assertEqual(image.pixelColor(181, row), background)
+
+    def test_display_clamps_at_both_edges_and_resizes(self) -> None:
+        fill = QColor(justfan.CHANNEL_COLORS[2])
+        background = self.meter.palette().color(justfan.QPalette.ColorRole.AlternateBase)
+        marker = self.meter.palette().color(justfan.QPalette.ColorRole.WindowText)
+        for width in (96, 480):
+            with self.subTest(width=width):
+                self.meter.resize(width, 40)
+                row = self.meter.height() - 6
+                self.meter.set_levels(-180.0, -150.0)
+                image = self.render_meter()
+                self.assertEqual(image.pixelColor(0, row), marker)
+                self.assertEqual(image.pixelColor(2, row), background)
+                self.assertEqual(self.meter.current, -180.0)
+                self.meter.set_levels(6.0, 12.0)
+                image = self.render_meter()
+                self.assertEqual(image.pixelColor(0, row), fill)
+                self.assertEqual(image.pixelColor(width - 3, row), fill)
+                self.assertEqual(image.pixelColor(width - 1, row), marker)
+                self.assertEqual(self.meter.peak, 12.0)
+
+    def test_channel_readings_stay_inside_meter_at_compact_widths(self) -> None:
+        channel = justfan.ChannelWidget(2)
+        self.addCleanup(channel.close)
+        channel.update_levels(justfan.DB_FLOOR, justfan.DB_FLOOR)
+        channel.show()
+        assert self.application is not None
+        for width in (264, 467):
+            with self.subTest(width=width):
+                channel.resize(max(width, channel.minimumSizeHint().width()), channel.minimumSizeHint().height())
+                self.application.processEvents()
+                meter = channel.level_meter
+                current = channel.current_values[0]
+                peak = channel.peak_values[0]
+                for label in (current, peak):
+                    self.assertTrue(meter.rect().contains(label.geometry()))
+                    self.assertGreaterEqual(label.y(), 6)
+                    self.assertLess(label.geometry().bottom(), meter.height() - 6)
+                    self.assertLessEqual(abs(label.geometry().center().y() - meter.rect().center().y()), 1)
+                    self.assertGreaterEqual(label.width(), label.fontMetrics().horizontalAdvance(label.text()))
+                    self.assertGreaterEqual(label.height(), label.minimumSizeHint().height())
+                self.assertLess(current.geometry().right(), peak.geometry().left())
+
+    def test_text_contrast_for_all_channel_colors_and_light_dark_backgrounds(self) -> None:
+        for color in (*justfan.CHANNEL_COLORS, "#000000", "#ffffff", "#edf2f3", "#26343b"):
+            with self.subTest(color=color):
+                background = QColor(color)
+                foreground = self.meter._text_color(background)
+                luminances = []
+                for sample in (background, foreground):
+                    components = [
+                        component / 12.92 if component <= 0.04045 else ((component + 0.055) / 1.055) ** 2.4
+                        for component in (sample.redF(), sample.greenF(), sample.blueF())
+                    ]
+                    luminances.append(0.2126 * components[0] + 0.7152 * components[1] + 0.0722 * components[2])
+                self.assertGreaterEqual((max(luminances) + 0.05) / (min(luminances) + 0.05), 4.5)
+
+    def test_inline_text_changes_color_across_fill_and_peak_marker(self) -> None:
+        channel = justfan.ChannelWidget(2)
+        self.addCleanup(channel.close)
+        channel.show()
+        channel.resize(max(467, channel.minimumSizeHint().width()), channel.minimumSizeHint().height())
+        assert self.application is not None
+        self.application.processEvents()
+        self.meter = channel.level_meter
+        current_label = channel.current_values[0]
+        peak_label = channel.peak_values[0]
+        current_position = current_label.x() + current_label.fontMetrics().horizontalAdvance("-100.0") / 2
+        peak_position = peak_label.geometry().right() - peak_label.fontMetrics().horizontalAdvance("-10.0") / 2
+        current = justfan.DB_FLOOR + 120 * current_position / self.meter.width()
+        peak = justfan.DB_FLOOR + 120 * peak_position / self.meter.width()
+        for fill_color, track_color in (("#5364ab", "#edf2f3"), ("#f3dc73", "#18323b")):
+            with self.subTest(fill=fill_color, track=track_color):
+                self.meter._color = QColor(fill_color)
+                palette = self.meter.palette()
+                palette.setColor(justfan.QPalette.ColorRole.AlternateBase, QColor(track_color))
+                self.meter.setPalette(palette)
+                channel.update_levels(current, peak)
+                image = self.render_meter()
+                mask = QImage(self.meter.size(), QImage.Format.Format_ARGB32)
+                mask.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(mask)
+                try:
+                    painter.setPen(Qt.GlobalColor.white)
+                    for label in (current_label, peak_label):
+                        painter.setFont(label.font())
+                        painter.drawText(label.contentsRect().translated(label.pos()), label.alignment(), label.text())
+                finally:
+                    painter.end()
+                backgrounds = set()
+                for row in range(mask.height()):
+                    for column in range(mask.width()):
+                        if mask.pixelColor(column, row).alpha() == 255:
+                            background = image.pixelColor(column, 0)
+                            backgrounds.add(background.name())
+                            self.assertEqual(image.pixelColor(column, row), self.meter._text_color(background))
+                self.assertIn(fill_color, backgrounds)
+                self.assertIn(track_color, backgrounds)
 
 
 class InterfaceTests(unittest.TestCase):
@@ -1082,6 +1230,9 @@ class InterfaceTests(unittest.TestCase):
         for widget in self.window.channel_widgets:
             self.assertEqual(widget.current_values[0].text(), "-12.0")
             self.assertEqual(widget.peak_values[0].text(), "-6.0")
+            assert widget.level_meter.current is not None and widget.level_meter.peak is not None
+            self.assertAlmostEqual(widget.level_meter.current, 20 * np.log10(0.25), places=5)
+            self.assertAlmostEqual(widget.level_meter.peak, 20 * np.log10(0.5), places=5)
             self.assertTrue(widget.current_values[0].alignment() & Qt.AlignmentFlag.AlignLeft)
             self.assertTrue(widget.peak_values[0].alignment() & Qt.AlignmentFlag.AlignRight)
             for label in widget.current_values[1:] + widget.peak_values[1:]:
@@ -1091,6 +1242,21 @@ class InterfaceTests(unittest.TestCase):
         frequencies = self.window.spectra.curves[0].getData()[0]
         self.assertGreater(len(frequencies), 0)
         self.assertLessEqual(frequencies[-1], 10_000 + settings.sample_rate / settings.block_size)
+
+    def test_noise_meter_peak_holds_and_resets_while_stopped(self) -> None:
+        self.push(0.5)
+        self.push(0.25)
+        meter = self.window.channel_widgets[0].level_meter
+        assert meter.current is not None and meter.peak is not None
+        self.assertGreater(meter.peak, meter.current)
+        current = meter.current
+        self.window._toggle_capture()
+        self.assertEqual(meter.current, current)
+        self.assertGreater(meter.peak, current)
+        self.window._reset_measurement()
+        self.assertEqual(meter.current, current)
+        self.assertEqual(meter.peak, current)
+        self.assertEqual(self.window.channel_widgets[0].peak_values[0].text(), "-12.0")
 
     def test_channel_checkbox_hides_spectrum_without_losing_readings(self) -> None:
         assert self.application is not None

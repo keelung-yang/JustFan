@@ -20,8 +20,8 @@ from urllib.parse import quote
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
-from PySide6.QtCore import QByteArray, QEvent, QObject, QRectF, QSettings, QSignalBlocker, QStandardPaths, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QIcon, QImage, QMouseEvent, QPainter, QPalette, QPixmap, QPixmapCache, QResizeEvent
+from PySide6.QtCore import QByteArray, QEvent, QObject, QRect, QRectF, QSettings, QSignalBlocker, QStandardPaths, Qt, QTimer, Signal
+from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QIcon, QImage, QMouseEvent, QPaintEvent, QPainter, QPalette, QPixmap, QPixmapCache, QRegion, QResizeEvent
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
 	QAbstractItemView,
@@ -60,7 +60,7 @@ pg.setConfigOptions(
 	antialias=False,
 )
 
-VERSION = "1.3"
+VERSION = "1.5"
 DB_FLOOR = -120.0
 DEFAULT_MAX_CHANNELS = 8
 FFT_SIZES = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
@@ -500,6 +500,70 @@ class FanIconAnimator(QObject):
 		self._show_icon(self.frames[self.frame_index])
 
 
+class LevelMeter(QWidget):
+	def __init__(self, color: str, parent: QWidget | None = None) -> None:
+		super().__init__(parent)
+		self.current: float | None = None
+		self.peak: float | None = None
+		self._color = QColor(color)
+		self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+		self.setAccessibleName("Noise level (dBFS)")
+		self.setToolTip("Scale: -120 to 0 dBFS. The vertical line marks the highest block RMS level in this measurement.")
+
+	def set_levels(self, current: float, peak: float) -> None:
+		self.current = current
+		self.peak = peak
+		self.setAccessibleDescription(f"Current {current:.1f} dBFS; measurement peak {peak:.1f} dBFS.")
+		self.update()
+
+	def _paint_regions(self) -> list[tuple[QRect, QColor]]:
+		track = self.rect()
+		regions = [(track, self.palette().color(QPalette.ColorRole.AlternateBase))]
+		if self.current is not None:
+			fraction = min(1.0, max(0.0, (self.current - DB_FLOOR) / -DB_FLOOR))
+			regions.append((QRect(0, 0, round(track.width() * fraction), track.height()), self._color))
+		if self.peak is not None:
+			fraction = min(1.0, max(0.0, (self.peak - DB_FLOOR) / -DB_FLOOR))
+			position = max(0, min(track.width() - 2, round(track.width() * fraction) - 1))
+			regions.append((QRect(position, 0, 2, track.height()), self.palette().color(QPalette.ColorRole.WindowText)))
+		return regions
+
+	@staticmethod
+	def _text_color(background: QColor) -> QColor:
+		components = [
+			component / 12.92 if component <= 0.04045 else ((component + 0.055) / 1.055) ** 2.4
+			for component in (background.redF(), background.greenF(), background.blueF())
+		]
+		luminance = 0.2126 * components[0] + 0.7152 * components[1] + 0.0722 * components[2]
+		return QColor("#ffffff" if luminance < 0.179 else "#000000")
+
+	def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+		if event.type() != QEvent.Type.Paint or not isinstance(watched, QLabel):
+			return super().eventFilter(watched, event)
+		painter = QPainter(watched)
+		try:
+			painter.setFont(watched.font())
+			covered = QRegion()
+			for rectangle, background in reversed(self._paint_regions()):
+				region = QRegion(rectangle.translated(-watched.pos()))
+				painter.setClipRegion(region.subtracted(covered))
+				painter.setPen(self._text_color(background))
+				painter.drawText(watched.contentsRect(), watched.alignment(), watched.text())
+				covered = covered.united(region)
+		finally:
+			painter.end()
+		return True
+
+	def paintEvent(self, event: QPaintEvent) -> None:
+		super().paintEvent(event)
+		painter = QPainter(self)
+		try:
+			for rectangle, background in self._paint_regions():
+				painter.fillRect(rectangle, background)
+		finally:
+			painter.end()
+
+
 class ChannelWidget(QFrame):
 	sensor_commands_requested = Signal(int)
 	enabled_changed = Signal(int, bool)
@@ -532,6 +596,11 @@ class ChannelWidget(QFrame):
 		layout.addWidget(QLabel("Peak"), 0, 2, Qt.AlignmentFlag.AlignRight)
 		self.current_values = []
 		self.peak_values = []
+		self.level_meter = LevelMeter(CHANNEL_COLORS[channel % len(CHANNEL_COLORS)])
+		level_layout = QHBoxLayout(self.level_meter)
+		level_layout.setContentsMargins(8, 6, 8, 6)
+		level_layout.setSpacing(12)
+		layout.addWidget(self.level_meter, 1, 1, 1, 2)
 		for row, name in enumerate(("Noise (dBFS)", "Temperature (C)", "Speed (RPM)"), 1):
 			layout.addWidget(QLabel(name), row, 0)
 			current = QLabel("--")
@@ -541,8 +610,14 @@ class ChannelWidget(QFrame):
 				label.setMinimumWidth(max(46, label.fontMetrics().horizontalAdvance(f"{DB_FLOOR:.1f}") + 4))
 			current.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 			peak.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-			layout.addWidget(current, row, 1)
-			layout.addWidget(peak, row, 2)
+			if row == 1:
+				current.installEventFilter(self.level_meter)
+				peak.installEventFilter(self.level_meter)
+				level_layout.addWidget(current, 1)
+				level_layout.addWidget(peak, 1)
+			else:
+				layout.addWidget(current, row, 1)
+				layout.addWidget(peak, row, 2)
 			self.current_values.append(current)
 			self.peak_values.append(peak)
 		layout.setColumnStretch(1, 1)
@@ -561,6 +636,7 @@ class ChannelWidget(QFrame):
 	def update_levels(self, current: float, peak: float) -> None:
 		self.current_values[0].setText(f"{current:.1f}")
 		self.peak_values[0].setText(f"{peak:.1f}")
+		self.level_meter.set_levels(current, peak)
 
 
 class SpectrumPanel(QScrollArea):
