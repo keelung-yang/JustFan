@@ -15,9 +15,9 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 from PySide6.QtCore import QSettings, QSize, Qt, QTimer
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QImage, QPixmapCache
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QDialogButtonBox, QLabel, QLineEdit, QStackedWidget, QTableWidget, QWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QDialogButtonBox, QGraphicsItem, QLabel, QLineEdit, QStackedWidget, QTableWidget, QWidget
 
 import JustFan as justfan
 
@@ -390,6 +390,41 @@ class InterfaceTests(unittest.TestCase):
 
     def test_spectrum_defaults_to_frequency_range_up_to_10_khz(self) -> None:
         self.assertEqual(self.window.spectra.plots[0].getViewBox().viewRange()[0], [0, 10_000])
+
+    def test_static_spectrum_axes_use_device_cache(self) -> None:
+        axis_cache_kib = 7680 * 4320 * 4 * 2 // 1024
+        self.assertGreaterEqual(QPixmapCache.cacheLimit(), axis_cache_kib * 2)
+        for plot in self.window.spectra.plots:
+            for name in ("left", "bottom"):
+                self.assertEqual(plot.getAxis(name).cacheMode(), QGraphicsItem.CacheMode.DeviceCoordinateCache)
+
+    def test_axis_cache_refreshes_after_range_and_size_changes(self) -> None:
+        assert self.application is not None
+        self.push(0.5)
+        self.push(0.25)
+        for width, height, minimum, maximum in (
+            (1360, 820, 0, 10_000),
+            (1100, 680, 1000, 8000),
+            (1700, 1000, 500, 16_000),
+        ):
+            with self.subTest(width=width, minimum=minimum, maximum=maximum):
+                self.window.resize(width, height)
+                self.window.frequency_minimum.setValue(minimum)
+                self.window.frequency_maximum.setValue(maximum)
+                for plot in self.window.spectra.plots:
+                    plot.setYRange(-110, -5, padding=0)
+                self.application.processEvents()
+                for plot in self.window.spectra.plots:
+                    cached = plot.viewport().grab().toImage()
+                    self.assertEqual(plot.getAxis("bottom").range, [minimum, maximum])
+                    self.assertEqual(plot.getAxis("left").range, [-110, -5])
+                    axes = [plot.getAxis(name) for name in ("left", "bottom")]
+                    for axis in axes:
+                        axis.setCacheMode(QGraphicsItem.CacheMode.NoCache)
+                    for axis in axes:
+                        axis.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+                    rebuilt = plot.viewport().grab().toImage()
+                    self.assertEqual(cached, rebuilt)
 
     def test_spectrum_default_frequency_range_is_capped_at_nyquist(self) -> None:
         panel = justfan.SpectrumPanel()

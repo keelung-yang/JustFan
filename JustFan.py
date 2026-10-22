@@ -15,7 +15,7 @@ from urllib.parse import quote
 import numpy as np
 import sounddevice as sd
 from PySide6.QtCore import QByteArray, QEvent, QObject, QRectF, QSettings, QSignalBlocker, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QIcon, QImage, QMouseEvent, QPainter, QPalette, QPixmap, QResizeEvent
+from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QIcon, QImage, QMouseEvent, QPainter, QPalette, QPixmap, QPixmapCache, QResizeEvent
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
 	QAbstractItemView,
@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 	QDoubleSpinBox,
 	QFormLayout,
 	QFrame,
+	QGraphicsItem,
 	QGridLayout,
 	QHeaderView,
 	QHBoxLayout,
@@ -48,9 +49,12 @@ from PySide6.QtWidgets import (
 )
 
 import pyqtgraph as pg
+pg.setConfigOptions(
+	useOpenGL=False,
+	antialias=False,
+)
 
-
-VERSION = "1.2"
+VERSION = "1.3"
 DB_FLOOR = -120.0
 DEFAULT_MAX_CHANNELS = 8
 FFT_SIZES = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
@@ -440,6 +444,8 @@ class SpectrumPanel(QScrollArea):
 			plot.setLabel("bottom", "Frequency", units="Hz")
 			plot.setLabel("left", "RMS amplitude", units="dBFS")
 			plot.showGrid(x=True, y=True, alpha=0.15)
+			for axis in ("left", "bottom"):
+				plot.getAxis(axis).setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
 			plot.setXRange(
 				min(self.frequency_range[0], sample_rate / 2 - 1),
 				min(self.frequency_range[1], sample_rate / 2),
@@ -1074,6 +1080,7 @@ def configure_application(application: QApplication) -> None:
 	application.setWindowIcon(QIcon(str(Path(__file__).with_name("JustFan.ico"))))
 	application.setStyle("Fusion")
 	application.setFont(QFont("Segoe UI" if sys.platform == "win32" else "Noto Sans", 10))
+	QPixmapCache.setCacheLimit(max(QPixmapCache.cacheLimit(), 512 * 1024))
 	palette = QPalette()
 	for role, color in (
 		(QPalette.ColorRole.Window, "#f1f4f6"),
