@@ -6,3 +6,7 @@ __pycache__/
 # PyInstaller output
 /build/
 /dist/
+
+/Records/
+*.wav
+*.WAV

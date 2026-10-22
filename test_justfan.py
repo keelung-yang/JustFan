@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
+import soundfile as sf
 from PySide6.QtCore import QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import QImage, QPixmapCache
 from PySide6.QtTest import QTest
@@ -157,6 +158,242 @@ class SignalTests(unittest.TestCase):
             justfan.SpectrumAnalyzer(self.sample_rate, self.size).analyze(np.zeros((128, 2)))
 
 
+class RecordingPathTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+
+    def test_writable_current_directory_uses_records_and_removes_probes(self) -> None:
+        with (
+            patch.object(justfan.Path, "cwd", return_value=self.directory),
+            patch.object(justfan.QStandardPaths, "writableLocation") as music,
+        ):
+            result = justfan.recording_directory()
+        self.assertEqual(result, self.directory / "Records")
+        self.assertTrue(result.is_dir())
+        self.assertEqual(list(result.iterdir()), [])
+        self.assertEqual(list(self.directory.iterdir()), [result])
+        music.assert_not_called()
+
+    def test_unwritable_current_or_records_directory_falls_back_to_music(self) -> None:
+        music = self.directory / "Music"
+        probe = justfan.TemporaryFile
+        for denied in (self.directory, self.directory / "Records"):
+            with self.subTest(denied=denied):
+                def checked_probe(*, dir: Path):
+                    if dir == denied:
+                        raise PermissionError("Directory is read-only")
+                    return probe(dir=dir)
+
+                with (
+                    patch.object(justfan.Path, "cwd", return_value=self.directory),
+                    patch.object(justfan.QStandardPaths, "writableLocation", return_value=str(music)),
+                    patch.object(justfan, "TemporaryFile", side_effect=checked_probe),
+                ):
+                    result = justfan.recording_directory()
+                self.assertEqual(result, music / "JustFan")
+                self.assertTrue(result.is_dir())
+                self.assertEqual(list(result.iterdir()), [])
+
+    def test_no_writable_directory_reports_failure(self) -> None:
+        with (
+            patch.object(justfan.Path, "cwd", return_value=self.directory),
+            patch.object(justfan.QStandardPaths, "writableLocation", return_value=str(self.directory / "Music")),
+            patch.object(justfan, "TemporaryFile", side_effect=PermissionError("No writable directory")),
+        ):
+            with self.assertRaisesRegex(PermissionError, "No writable directory"):
+                justfan.recording_directory()
+
+    def test_file_name_uses_device_item_and_safe_start_time(self) -> None:
+        path = justfan.new_recording_path(self.directory, '1. Mic\u00ae\u00a9\u2122 / USB: "Input" [WASAPI]')
+        self.assertRegex(path.name, r'^1\. Mic _ USB_ _Input_ \[WASAPI\]_\d{8}-\d{6}-\d{6}_recording\.wav$')
+        self.assertEqual(path.parent, self.directory)
+        self.assertEqual(path.stat().st_size, 0)
+        localized = justfan.new_recording_path(self.directory, "2. \u9ea6\u514b\u98ce Caf\u00e9 + USB [API]")
+        self.assertTrue(localized.name.startswith("2. \u9ea6\u514b\u98ce Caf\u00e9 + USB [API]_"))
+        symbols_only = justfan.new_recording_path(self.directory, "\u00ae\u00a9\u2122")
+        self.assertTrue(symbols_only.name.startswith("Device_"))
+        long_name = justfan.new_recording_path(self.directory, "\u9ea6\u514b\u98ce" * 100)
+        self.assertLess(len(long_name.name.encode("utf-8")), 255)
+
+    def test_identical_start_times_never_overwrite_an_existing_file(self) -> None:
+        started = justfan.datetime(2026, 10, 22, 12, 30, 45, 123456)
+        with patch.object(justfan, "datetime") as clock:
+            clock.now.return_value = started
+            first = justfan.new_recording_path(self.directory, "1. Microphone [API]")
+            first.write_bytes(b"Existing recording")
+            second = justfan.new_recording_path(self.directory, "1. Microphone [API]")
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.read_bytes(), b"Existing recording")
+        self.assertTrue(second.exists())
+
+
+class RecordingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "recording.wav"
+        self.settings = justfan.AudioSettings(48000, 2, 2048, 0.01)
+
+    def test_float32_format_preserves_samples_and_channel_order(self) -> None:
+        recorder = justfan.AudioRecorder(self.path, self.settings)
+        self.addCleanup(recorder.stop)
+        samples = np.array(
+            [[-1.2, 1.2], [-1.0, 1.0], [-0.5, 0.5], [0.0, -0.0], [1e-10, -1e-10], [1e-30, -1e-30]],
+            dtype=np.float32,
+        )
+        expected = samples.copy()
+        recorder.push(samples)
+        samples.fill(0)
+        recorder.stop()
+        self.assertEqual(recorder.error, "")
+        with sf.SoundFile(self.path) as recording:
+            self.assertEqual(recording.format, "WAV")
+            self.assertEqual(recording.subtype, "FLOAT")
+            self.assertEqual(recording.channels, 2)
+            self.assertEqual(recording.samplerate, 48000)
+            self.assertEqual(recording.frames, len(expected))
+            actual = recording.read(dtype="float32", always_2d=True)
+        np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+        self.assertEqual(self.path.stat().st_size, recorder._header_bytes + expected.nbytes)
+
+    def test_all_blocks_and_eight_channels_are_saved(self) -> None:
+        settings = justfan.AudioSettings(44100, 8, 2048, 0.01)
+        recorder = justfan.AudioRecorder(self.path, settings)
+        self.addCleanup(recorder.stop)
+        samples = np.arange(32, dtype=np.float32).reshape(4, 8) / 32
+        recorder.push(samples[:2])
+        recorder.push(samples[2:])
+        recorder.stop()
+        recorder.stop()
+        self.assertEqual(recorder.error, "")
+        self.assertEqual(recorder.frames, 4)
+        with sf.SoundFile(self.path) as recording:
+            self.assertEqual(recording.channels, 8)
+            self.assertEqual(recording.samplerate, 44100)
+            self.assertEqual(recording.frames, 4)
+            self.assertEqual(recording.subtype, "FLOAT")
+            actual = recording.read(dtype="float32", always_2d=True)
+        np.testing.assert_array_equal(actual, samples)
+        self.assertEqual(self.path.stat().st_size, recorder._header_bytes + 4 * 8 * 4)
+
+    def test_empty_recording_has_a_valid_header(self) -> None:
+        recorder = justfan.AudioRecorder(self.path, self.settings)
+        recorder.stop()
+        self.assertEqual(recorder.error, "")
+        with sf.SoundFile(self.path) as recording:
+            self.assertEqual(recording.frames, 0)
+            self.assertEqual(recording.channels, 2)
+            self.assertEqual(recording.subtype, "FLOAT")
+
+    def test_automatic_recording_name_uses_the_written_audio_duration(self) -> None:
+        settings = justfan.AudioSettings(4, 2, 4, 0.01)
+        for frames, duration in (
+            (1, "000000"), (239, "000059"), (240, "000100"),
+            (14399, "005959"), (14400, "010000"), (14895, "010203"),
+        ):
+            with self.subTest(frames=frames):
+                path = justfan.new_recording_path(self.path.parent, "1. Microphone [API]")
+                recorder = justfan.AudioRecorder(path, settings, append_duration=True)
+                self.addCleanup(recorder.stop)
+                recorder.push(np.zeros((frames, 2), dtype=np.float32))
+                recorder.stop()
+                self.assertEqual(recorder.error, "")
+                self.assertFalse(path.exists())
+                self.assertEqual(recorder.path.name, path.stem.removesuffix("_recording") + f"_{duration}.wav")
+                with sf.SoundFile(recorder.path) as recording:
+                    self.assertEqual(recording.frames, frames)
+                recorder.stop()
+                self.assertTrue(recorder.path.exists())
+
+    def test_final_recording_name_never_overwrites_an_existing_file(self) -> None:
+        path = justfan.new_recording_path(self.path.parent, "1. Microphone [API]")
+        existing = path.with_name(path.stem.removesuffix("_recording") + "_000000.wav")
+        existing.write_bytes(b"Existing recording")
+        recorder = justfan.AudioRecorder(path, self.settings, append_duration=True)
+        self.addCleanup(recorder.stop)
+        recorder.stop()
+        self.assertEqual(recorder.error, "")
+        self.assertNotEqual(recorder.path, existing)
+        self.assertEqual(existing.read_bytes(), b"Existing recording")
+        with sf.SoundFile(recorder.path) as recording:
+            self.assertEqual(recording.frames, 0)
+
+    def test_failed_final_rename_retains_the_recording(self) -> None:
+        path = justfan.new_recording_path(self.path.parent, "1. Microphone [API]")
+        recorder = justfan.AudioRecorder(path, self.settings, append_duration=True)
+        self.addCleanup(recorder.stop)
+        recorder.push(np.zeros((16, 2), dtype=np.float32))
+        with patch.object(justfan.Path, "replace", side_effect=PermissionError("Rename denied")):
+            recorder.stop()
+        self.assertIn("Rename denied", recorder.error)
+        self.assertEqual(recorder.path, path)
+        with sf.SoundFile(path) as recording:
+            self.assertEqual(recording.frames, 16)
+        self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_disk_failure_is_reported_without_raising_in_callback(self) -> None:
+        recorder = justfan.AudioRecorder(self.path, self.settings)
+        self.addCleanup(recorder.stop)
+        with patch.object(recorder._file, "write", side_effect=OSError("Disk full")):
+            recorder.push(np.zeros((16, 2), dtype=np.float32))
+            recorder.stop()
+        self.assertIn("Disk full", recorder.error)
+
+    def test_full_queue_stops_recording_without_blocking_the_callback(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        with patch.object(justfan.AudioRecorder, "QUEUE_SIZE", 1):
+            recorder = justfan.AudioRecorder(self.path, self.settings)
+        self.addCleanup(recorder.stop)
+        self.addCleanup(release.set)
+        write = recorder._file.write
+
+        def slow_write(samples: np.ndarray) -> None:
+            entered.set()
+            if not release.wait(2.0):
+                raise TimeoutError("Test writer was not released")
+            write(samples)
+
+        with patch.object(recorder._file, "write", side_effect=slow_write):
+            samples = np.zeros((16, 2), dtype=np.float32)
+            recorder.push(samples)
+            self.assertTrue(entered.wait(2.0))
+            recorder.push(samples)
+            recorder.push(samples)
+            self.assertIn("could not keep up", recorder.error)
+            release.set()
+            recorder.stop()
+        with sf.SoundFile(self.path) as recording:
+            self.assertEqual(recording.frames, 32)
+
+    def test_invalid_recording_settings_do_not_create_a_file(self) -> None:
+        for settings in (
+            justfan.AudioSettings(0, 2, 2048, 0.01),
+            justfan.AudioSettings(48000.1, 2, 2048, 0.01),
+            justfan.AudioSettings(48000, 0, 2048, 0.01),
+        ):
+            with self.subTest(settings=settings):
+                with self.assertRaises(ValueError):
+                    justfan.AudioRecorder(self.path, settings)
+                self.assertFalse(self.path.exists())
+
+    def test_wav_size_limit_preserves_a_readable_partial_recording(self) -> None:
+        recorder = justfan.AudioRecorder(self.path, self.settings)
+        self.addCleanup(recorder.stop)
+        samples = np.zeros((16, 2), dtype=np.float32)
+        limit = recorder._header_bytes + samples.nbytes
+        with patch.object(recorder, "MAX_FILE_BYTES", limit):
+            recorder.push(samples)
+            recorder.push(samples)
+            recorder.stop()
+        self.assertIn("4 GiB", recorder.error)
+        self.assertEqual(self.path.stat().st_size, limit)
+        with sf.SoundFile(self.path) as recording:
+            self.assertEqual(recording.frames, 16)
+
+
 class CaptureTests(unittest.TestCase):
     def setUp(self) -> None:
         self.device = justfan.InputDevice(3, "Test microphone", "Test API", 2, 48000, 0.01)
@@ -195,6 +432,73 @@ class CaptureTests(unittest.TestCase):
         self.assertTrue(failed.closed)
         self.assertIsNone(capture.stream)
         self.assertIsNone(capture.buffer)
+
+    def test_recording_saves_all_callbacks_only_between_start_and_stop(self) -> None:
+        capture = justfan.AudioCapture()
+        self.addCleanup(capture.stop)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "capture.wav"
+            with patch.object(justfan.sd, "check_input_settings"), patch.object(justfan.sd, "InputStream", side_effect=FakeStream):
+                capture.start(self.device, self.settings)
+            stream = capture.stream
+            assert isinstance(stream, FakeStream)
+            samples = np.full((2048, 2), 0.25, dtype=np.float32)
+            stream.callback(samples, 2048, None, "")
+            capture.start_recording(path)
+            stream.callback(samples, 2048, None, "")
+            stream.callback(samples, 2048, None, "")
+            recorder = capture.stop_recording()
+            stream.callback(samples, 2048, None, "")
+            self.assertIsNotNone(recorder)
+            self.assertIsNone(capture.recorder)
+            self.assertTrue(stream.active)
+            with sf.SoundFile(path) as recording:
+                self.assertEqual(recording.frames, 4096)
+                self.assertEqual(recording.channels, 2)
+
+    def test_recording_requires_capture_and_rejects_duplicate_start(self) -> None:
+        capture = justfan.AudioCapture()
+        self.addCleanup(capture.stop)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "capture.wav"
+            with self.assertRaisesRegex(ValueError, "Start audio capture"):
+                capture.start_recording(path)
+            self.assertFalse(path.exists())
+            with patch.object(justfan.sd, "check_input_settings"), patch.object(justfan.sd, "InputStream", side_effect=FakeStream):
+                capture.start(self.device, self.settings)
+            capture.start_recording(path)
+            recorder = capture.recorder
+            with self.assertRaisesRegex(ValueError, "already in progress"):
+                capture.start_recording(path)
+            self.assertIs(capture.recorder, recorder)
+            capture.stop()
+            self.assertIsNone(capture.recorder)
+            with sf.SoundFile(path) as recording:
+                self.assertEqual(recording.frames, 0)
+
+    def test_late_callback_after_restart_cannot_enter_a_new_recording(self) -> None:
+        capture = justfan.AudioCapture()
+        self.addCleanup(capture.stop)
+        with tempfile.TemporaryDirectory() as directory:
+            first_path = Path(directory) / "first.wav"
+            second_path = Path(directory) / "second.wav"
+            with patch.object(justfan.sd, "check_input_settings"), patch.object(justfan.sd, "InputStream", side_effect=FakeStream):
+                capture.start(self.device, self.settings)
+                old_stream = capture.stream
+                assert isinstance(old_stream, FakeStream)
+                capture.start_recording(first_path)
+                samples = np.full((2048, 2), 0.25, dtype=np.float32)
+                old_stream.callback(samples, 2048, None, "")
+                capture.start(self.device, self.settings)
+            stream = capture.stream
+            assert isinstance(stream, FakeStream)
+            capture.start_recording(second_path)
+            old_stream.callback(samples, 2048, None, "")
+            stream.callback(samples, 2048, None, "")
+            capture.stop()
+            for path in (first_path, second_path):
+                with sf.SoundFile(path) as recording:
+                    self.assertEqual(recording.frames, 2048)
 
     def test_stop_closes_even_if_driver_stop_fails(self) -> None:
         capture = justfan.AudioCapture()
@@ -257,6 +561,9 @@ class InterfaceTests(unittest.TestCase):
         self.enterContext(patch.object(justfan.sd, "default", SimpleNamespace(device=(3, -1))))
         self.check = self.enterContext(patch.object(justfan.sd, "check_input_settings"))
         self.enterContext(patch.object(justfan.sd, "InputStream", side_effect=FakeStream))
+        self.recording_folder = Path(self.directory.name) / "Records"
+        self.recording_folder.mkdir()
+        self.destination = self.enterContext(patch.object(justfan, "recording_directory", return_value=self.recording_folder))
         self.window = justfan.MainWindow(self.settings)
         self.addCleanup(self.window.close)
         self.window.show()
@@ -272,6 +579,9 @@ class InterfaceTests(unittest.TestCase):
         self.assertIsNone(window.capture.stream)
         self.assertEqual(window.start_button.text(), "Start")
         self.assertEqual(len(window.channel_widgets), 2)
+        self.assertFalse(window.record_checkbox.isChecked())
+        self.assertTrue(window.record_checkbox.isEnabled())
+        self.destination.assert_not_called()
 
     def test_ctrl_c_closes_window_and_restores_signal_handler(self) -> None:
         assert self.application is not None
@@ -388,6 +698,238 @@ class InterfaceTests(unittest.TestCase):
         stream.callback(np.full((settings.block_size, settings.channels), amplitude), settings.block_size, None, "")
         self.window._update_measurement()
 
+    def record(self) -> justfan.AudioRecorder:
+        self.window._stop_capture()
+        self.window.record_checkbox.setChecked(True)
+        self.window.start_capture()
+        recorder = self.window.capture.recorder
+        assert recorder is not None
+        return recorder
+
+    def test_recording_checkbox_saves_wav_until_capture_stops(self) -> None:
+        self.push()
+        recorder = self.record()
+        original_path = recorder.path
+        self.assertTrue(self.window.record_checkbox.isChecked())
+        self.assertFalse(self.window.record_checkbox.isEnabled())
+        self.assertEqual(self.window.statusBar().currentMessage(), "")
+        self.assertFalse(self.window.state_label.isHidden())
+        self.assertTrue(self.window.state_label.text().startswith("Live | "))
+        self.assertIsNone(self.window.findChild(justfan.QLabel, "recording"))
+        self.assertIn(str(original_path), self.window.record_checkbox.toolTip())
+        self.assertEqual(original_path.parent, self.recording_folder)
+        self.assertTrue(original_path.name.startswith(self.window.device_combo.currentText() + "_"))
+        self.push(0.5)
+        self.push(0.25)
+        settings = self.window.capture.settings
+        assert settings is not None
+        self.window.start_button.click()
+        self.assertIsNone(self.window.capture.recorder)
+        self.assertIsNone(self.window.capture.stream)
+        self.assertTrue(self.window.record_checkbox.isChecked())
+        self.assertTrue(self.window.record_checkbox.isEnabled())
+        self.assertEqual(self.window.statusBar().currentMessage(), "")
+        self.assertFalse(self.window.state_label.isHidden())
+        self.assertEqual(self.window.state_label.text(), "Stopped")
+        self.assertIn(str(recorder.path), self.window.record_checkbox.toolTip())
+        self.assertFalse(original_path.exists())
+        self.assertRegex(recorder.path.name, r'_\d{8}-\d{6}-\d{6}_\d{6}\.wav$')
+        with sf.SoundFile(recorder.path) as recording:
+            self.assertEqual(recording.frames, settings.block_size * 2)
+            self.assertEqual(recording.channels, settings.channels)
+            self.assertEqual(recording.subtype, "FLOAT")
+            self.assertEqual(recording.samplerate, int(settings.sample_rate))
+
+    def test_recording_directory_and_open_failures_do_not_prevent_capture(self) -> None:
+        self.window._stop_capture()
+        self.destination.side_effect = PermissionError("No writable directory")
+        self.window.record_checkbox.setChecked(True)
+        self.assertIsNone(self.window.capture.recorder)
+        self.assertFalse(self.window.record_checkbox.isChecked())
+        self.assertTrue(self.window.record_checkbox.isEnabled())
+        self.assertIn("No writable directory", self.window.notice.text())
+        self.window.start_button.click()
+        self.assertIsNotNone(self.window.capture.stream)
+        self.assertFalse(self.window.record_checkbox.isEnabled())
+        self.destination.side_effect = None
+        for error in (OSError("Read-only folder"), sf.SoundFileError("Read-only folder")):
+            with self.subTest(error=type(error).__name__):
+                self.window._stop_capture()
+                self.window.record_checkbox.setChecked(True)
+                with patch.object(justfan, "AudioRecorder", side_effect=error):
+                    self.window.start_button.click()
+                self.assertEqual(list(self.recording_folder.iterdir()), [])
+                self.assertIsNone(self.window.capture.recorder)
+                self.assertFalse(self.window.record_checkbox.isChecked())
+                self.assertFalse(self.window.record_checkbox.isEnabled())
+                self.assertIsNotNone(self.window.capture.stream)
+                self.assertIn("Read-only folder", self.window.notice.text())
+
+    def test_recording_checkbox_checks_destination_while_idle_and_follows_start_stop(self) -> None:
+        self.assertFalse(self.window.record_checkbox.isChecked())
+        self.assertFalse(self.window.record_checkbox.isEnabled())
+        palette = self.window.record_checkbox.palette()
+        for role in (justfan.QPalette.ColorRole.WindowText, justfan.QPalette.ColorRole.Text, justfan.QPalette.ColorRole.ButtonText):
+            self.assertNotEqual(
+                palette.color(justfan.QPalette.ColorGroup.Active, role),
+                palette.color(justfan.QPalette.ColorGroup.Disabled, role),
+            )
+        self.window.record_checkbox.click()
+        self.assertFalse(self.window.record_checkbox.isChecked())
+        self.assertIsNone(self.window.capture.recorder)
+        self.destination.assert_not_called()
+        self.window.start_button.click()
+        self.assertTrue(self.window.record_checkbox.isEnabled())
+        self.window.record_checkbox.setChecked(True)
+        self.destination.assert_called_once_with()
+        self.assertIsNone(self.window.capture.recorder)
+        self.assertEqual(list(self.recording_folder.iterdir()), [])
+        self.window.start_button.click()
+        recorder = self.window.capture.recorder
+        assert recorder is not None
+        self.assertFalse(self.window.record_checkbox.isEnabled())
+        self.window.record_checkbox.click()
+        self.assertTrue(self.window.record_checkbox.isChecked())
+        self.assertIs(self.window.capture.recorder, recorder)
+        self.push()
+        self.window.start_button.click()
+        self.assertTrue(self.window.record_checkbox.isChecked())
+        self.assertTrue(self.window.record_checkbox.isEnabled())
+        self.assertTrue(recorder.path.exists())
+        self.assertIsNone(self.window.capture.recorder)
+        self.window.start_button.click()
+        self.assertFalse(self.window.record_checkbox.isEnabled())
+        self.assertIsNotNone(self.window.capture.recorder)
+        self.assertIsNot(self.window.capture.recorder, recorder)
+
+    def test_recording_destination_is_rechecked_when_capture_starts(self) -> None:
+        self.window._stop_capture()
+        self.window.record_checkbox.setChecked(True)
+        self.destination.side_effect = PermissionError("Directory is now read-only")
+        self.window.start_button.click()
+        self.assertIsNotNone(self.window.capture.stream)
+        self.assertIsNone(self.window.capture.recorder)
+        self.assertFalse(self.window.record_checkbox.isChecked())
+        self.assertFalse(self.window.record_checkbox.isEnabled())
+        self.assertIn("Directory is now read-only", self.window.notice.text())
+        self.assertEqual(list(self.recording_folder.iterdir()), [])
+
+    def test_failed_capture_start_does_not_create_a_recording(self) -> None:
+        self.window._stop_capture()
+        self.window.record_checkbox.setChecked(True)
+        self.check.side_effect = justfan.sd.PortAudioError("Unsupported sample rate")
+        self.window.start_button.click()
+        self.assertIsNone(self.window.capture.stream)
+        self.assertIsNone(self.window.capture.recorder)
+        self.assertTrue(self.window.record_checkbox.isChecked())
+        self.assertTrue(self.window.record_checkbox.isEnabled())
+        self.assertEqual(list(self.recording_folder.iterdir()), [])
+
+    def test_recording_is_finalized_on_all_capture_exit_paths(self) -> None:
+        for action in ("stop", "apply", "refresh", "device", "disconnect", "close"):
+            with self.subTest(action=action):
+                recorder = self.record()
+                self.push()
+                settings = self.window.capture.settings
+                assert settings is not None
+                if action == "stop":
+                    self.window.start_button.click()
+                elif action == "apply":
+                    self.window.apply_button.click()
+                elif action == "refresh":
+                    self.window.refresh_devices()
+                elif action == "device":
+                    self.window.device_combo.setCurrentIndex(1 - self.window.device_combo.currentIndex())
+                elif action == "disconnect":
+                    stream = self.window.capture.stream
+                    assert isinstance(stream, FakeStream)
+                    stream.stop()
+                    self.window._update_measurement()
+                else:
+                    self.window.close()
+                if action == "apply":
+                    self.assertIsNotNone(self.window.capture.recorder)
+                    self.assertIsNot(self.window.capture.recorder, recorder)
+                    self.assertFalse(self.window.record_checkbox.isEnabled())
+                else:
+                    self.assertIsNone(self.window.capture.recorder)
+                    self.assertTrue(self.window.record_checkbox.isEnabled())
+                self.assertEqual(self.window.statusBar().currentMessage(), "")
+                with sf.SoundFile(recorder.path) as recording:
+                    self.assertEqual(recording.frames, settings.block_size)
+                    self.assertEqual(recording.channels, settings.channels)
+                    self.assertEqual(recording.subtype, "FLOAT")
+
+    def test_recording_ignores_channel_visibility_and_peak_resets(self) -> None:
+        recorder = self.record()
+        self.window.channel_widgets[0].enabled_checkbox.setChecked(False)
+        self.push()
+        self.window.reset_button.click()
+        self.assertIsNotNone(self.window.capture.recorder)
+        self.assertEqual(self.window.statusBar().currentMessage(), "")
+        self.push()
+        settings = self.window.capture.settings
+        assert settings is not None
+        self.window.start_button.click()
+        with sf.SoundFile(recorder.path) as recording:
+            self.assertEqual(recording.channels, 2)
+            self.assertEqual(recording.frames, settings.block_size * 2)
+
+    def test_recording_write_failure_stops_only_recording(self) -> None:
+        self.record()
+        recorder = self.window.capture.recorder
+        assert recorder is not None
+        with patch.object(recorder._file, "write", side_effect=OSError("Disk full")):
+            self.push()
+            recorder.stop()
+        self.window._update_measurement()
+        self.assertIsNone(self.window.capture.recorder)
+        self.assertIsNotNone(self.window.capture.stream)
+        self.assertFalse(self.window.record_checkbox.isEnabled())
+        self.assertFalse(self.window.record_checkbox.isChecked())
+        self.assertEqual(self.window.statusBar().currentMessage(), "")
+        self.assertFalse(self.window.state_label.isHidden())
+        self.assertTrue(self.window.state_label.text().startswith("Live | "))
+        self.assertIn("Disk full", self.window.notice.text())
+        self.window.start_button.click()
+        self.assertTrue(self.window.record_checkbox.isEnabled())
+
+    def test_recording_toolbar_stays_unclipped_and_stable_in_compact_windows(self) -> None:
+        assert self.application is not None
+        controls = self.window.findChild(QWidget, "controls")
+        assert controls is not None
+        self.record()
+        for width in (860, 1360):
+            with self.subTest(width=width):
+                self.window.resize(width, 680)
+                self.application.processEvents()
+                widgets = (
+                    self.window.device_combo, self.window.commands_button, self.window.record_checkbox,
+                    self.window.start_button, self.window.apply_button, self.window.reset_button,
+                )
+                for index, widget in enumerate(widgets):
+                    self.assertTrue(controls.rect().contains(widget.geometry()))
+                    for other in widgets[index + 1:]:
+                        self.assertFalse(widget.geometry().intersects(other.geometry()))
+                self.assertGreaterEqual(self.window.record_checkbox.width(), self.window.record_checkbox.sizeHint().width())
+        active_geometry = self.window.start_button.geometry()
+        self.window.start_button.click()
+        self.application.processEvents()
+        self.assertEqual(self.window.start_button.geometry(), active_geometry)
+
+    def test_recording_requires_running_capture_and_uses_active_settings(self) -> None:
+        self.window._stop_capture()
+        self.assertTrue(self.window.record_checkbox.isEnabled())
+        recorder = self.record()
+        self.assertFalse(self.window.record_checkbox.isEnabled())
+        self.window.sample_rate.setValue(44100)
+        self.window.channel_count.setValue(1)
+        self.push()
+        self.window.start_button.click()
+        with sf.SoundFile(recorder.path) as recording:
+            self.assertEqual(recording.samplerate, 48000)
+            self.assertEqual(recording.channels, 2)
+
     def test_spectrum_defaults_to_frequency_range_up_to_10_khz(self) -> None:
         self.assertEqual(self.window.spectra.plots[0].getViewBox().viewRange()[0], [0, 10_000])
 
@@ -497,10 +1039,24 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(self.window.windowTitle(), f"JustFan v{justfan.VERSION}")
         self.assertFalse(any(label.text() == "JustFan" for label in controls.findChildren(QLabel)))
         self.assertEqual(control_layout.count(), 2)
-        parameters = control_layout.itemAt(1).layout()
-        assert parameters is not None
-        self.assertIs(parameters.itemAtPosition(0, 4).widget(), self.window.commands_button)
-        self.assertIs(parameters.itemAtPosition(1, 4).widget(), self.window.apply_button)
+        parameter_item = control_layout.itemAt(1)
+        device_item = control_layout.itemAt(0)
+        assert parameter_item is not None and device_item is not None
+        parameters = parameter_item.layout()
+        assert isinstance(parameters, justfan.QGridLayout)
+        device_row = device_item.layout()
+        assert device_row is not None
+        self.assertEqual(device_row.indexOf(self.window.commands_button), 3)
+        option_item = parameters.itemAtPosition(0, 4)
+        action_item = parameters.itemAtPosition(1, 4)
+        assert option_item is not None and action_item is not None
+        options = option_item.layout()
+        actions = action_item.layout()
+        assert options is not None and actions is not None
+        option_widgets = [item.widget() for index in range(options.count()) if (item := options.itemAt(index)) is not None]
+        action_widgets = [item.widget() for index in range(actions.count()) if (item := actions.itemAt(index)) is not None]
+        self.assertEqual(option_widgets, [self.window.record_checkbox, None, self.window.reset_button])
+        self.assertEqual(action_widgets, [self.window.start_button, self.window.apply_button])
         assert self.application is not None
         for width in (1360, 860):
             with self.subTest(width=width):
@@ -510,13 +1066,14 @@ class InterfaceTests(unittest.TestCase):
                 widgets = (
                     self.window.sample_rate, self.window.channel_count, self.window.fft_size,
                     self.window.latency, self.window.commands_button, self.window.apply_button,
+                    self.window.start_button, self.window.record_checkbox, self.window.reset_button,
                 )
                 for index, widget in enumerate(widgets):
                     self.assertTrue(controls.rect().contains(widget.geometry()))
                     for other in widgets[index + 1:]:
                         self.assertFalse(widget.geometry().intersects(other.geometry()))
-                self.assertGreater(self.window.commands_button.y(), self.window.device_combo.geometry().bottom())
-                self.assertLess(self.window.commands_button.geometry().bottom(), self.window.apply_button.y())
+                self.assertLess(self.window.commands_button.geometry().bottom(), self.window.record_checkbox.y())
+                self.assertLess(self.window.reset_button.geometry().bottom(), self.window.apply_button.y())
                 self.assertGreaterEqual(self.window.commands_button.width(), self.window.commands_button.sizeHint().width())
 
     def test_current_peak_placeholders_and_graphs(self) -> None:

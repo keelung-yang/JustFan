@@ -2,19 +2,25 @@
 """Cross-platform cooling fan noise measurement and calibration utility."""
 
 import math
+import re
 import signal
 import sys
+import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
+from queue import Full, Queue
+from tempfile import TemporaryFile
 from threading import Lock, Thread
 from time import perf_counter
 from urllib.parse import quote
 
 import numpy as np
 import sounddevice as sd
-from PySide6.QtCore import QByteArray, QEvent, QObject, QRectF, QSettings, QSignalBlocker, Qt, QTimer, Signal
+import soundfile as sf
+from PySide6.QtCore import QByteArray, QEvent, QObject, QRectF, QSettings, QSignalBlocker, QStandardPaths, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QIcon, QImage, QMouseEvent, QPainter, QPalette, QPixmap, QPixmapCache, QResizeEvent
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
@@ -58,7 +64,45 @@ VERSION = "1.3"
 DB_FLOOR = -120.0
 DEFAULT_MAX_CHANNELS = 8
 FFT_SIZES = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
-CHANNEL_COLORS = ("#087f8c", "#c75b39", "#5364ab", "#ac4271", "#56842e", "#a87516")
+CHANNEL_COLORS = ("#087f8c", "#c75b39", "#5364ab", "#ac4271", "#56842e", "#a87516", "#c42f45", "#52616b")
+
+
+def recording_directory() -> Path:
+	def writable(directory: Path, *, create: bool = False) -> Path:
+		if create:
+			directory.mkdir(parents=True, exist_ok=True)
+		with TemporaryFile(dir=directory) as probe:
+			probe.write(b"JustFan")
+			probe.flush()
+		return directory
+
+	try:
+		current = writable(Path.cwd())
+		return writable(current / "Records", create=True)
+	except OSError:
+		music = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.MusicLocation)
+		return writable((Path(music) if music else Path.home() / "Music") / "JustFan", create=True)
+
+
+def reserve_recording_path(directory: Path, prefix: str, suffix: str) -> Path:
+	index = 0
+	while True:
+		name = f"{prefix}-{index}" if index else prefix
+		path = directory / f"{name}_{suffix}.wav"
+		try:
+			with path.open("xb"):
+				pass
+		except FileExistsError:
+			index += 1
+		else:
+			return path
+
+
+def new_recording_path(directory: Path, device_label: str) -> Path:
+	label = "".join(character for character in device_label if character.isascii() or not unicodedata.category(character).startswith("S"))
+	label = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", label).strip(" .")
+	label = label.encode("utf-8")[:128].decode("utf-8", errors="ignore").rstrip(" .") or "Device"
+	return reserve_recording_path(directory, f"{label}_{datetime.now():%Y%m%d-%H%M%S-%f}", "recording")
 
 
 def to_dbfs(amplitude: np.ndarray) -> np.ndarray:
@@ -109,6 +153,7 @@ class CaptureBuffer:
 		self._spectrum_peaks: np.ndarray | None = None
 		self._frames = 0
 		self._warning = ""
+		self._recorder: "AudioRecorder | None" = None
 
 	def push(self, samples: np.ndarray, warning: str = "") -> None:
 		samples = samples.copy()
@@ -124,6 +169,12 @@ class CaptureBuffer:
 			self._frames += len(samples)
 			if warning:
 				self._warning = warning
+			if self._recorder is not None:
+				self._recorder.push(samples)
+
+	def set_recorder(self, recorder: "AudioRecorder | None") -> None:
+		with self._lock:
+			self._recorder = recorder
 
 	def snapshot(self) -> AudioFrame | None:
 		with self._lock:
@@ -169,6 +220,107 @@ class AudioSettings:
 	latency: float
 
 
+class AudioRecorder:
+	QUEUE_SIZE = 128
+	MAX_FILE_BYTES = 0xFFFFFFFF + 8
+
+	def __init__(self, path: Path, settings: AudioSettings, *, append_duration: bool = False) -> None:
+		if settings.sample_rate <= 0 or settings.sample_rate != int(settings.sample_rate) or settings.channels < 1:
+			raise ValueError("WAV recording requires a positive integer sample rate and at least one channel.")
+		self.path = path
+		self.error = ""
+		self.frames = 0
+		self._channels = settings.channels
+		self._sample_rate = int(settings.sample_rate)
+		self._append_duration = append_duration
+		self._queue: Queue[np.ndarray | None] = Queue(maxsize=self.QUEUE_SIZE)
+		self._lock = Lock()
+		self._accepting = True
+		self._closed = False
+		self._file = sf.SoundFile(
+			path,
+			mode="w",
+			samplerate=int(settings.sample_rate),
+			channels=settings.channels,
+			format="WAV",
+			subtype="FLOAT",
+		)
+		try:
+			self._file.flush()
+			self._header_bytes = path.stat().st_size
+			self._thread = Thread(target=self._write, daemon=True)
+			self._thread.start()
+		except Exception:
+			try:
+				self._file.close()
+			except (OSError, sf.SoundFileError):
+				pass
+			raise
+
+	def push(self, samples: np.ndarray) -> None:
+		with self._lock:
+			if not self._accepting:
+				return
+			try:
+				self._queue.put_nowait(samples.copy())
+			except Full:
+				self.error = self.error or "Disk writing could not keep up; the recording is incomplete."
+				self._accepting = False
+
+	def _fail(self, message: str) -> None:
+		with self._lock:
+			self.error = self.error or message
+			self._accepting = False
+
+	def _write(self) -> None:
+		failed = False
+		try:
+			while True:
+				samples = self._queue.get()
+				if samples is None:
+					break
+				if failed:
+					continue
+				try:
+					data_bytes = (self.frames + len(samples)) * self._channels * 4
+					if self._header_bytes + data_bytes > self.MAX_FILE_BYTES:
+						raise ValueError("WAV recording reached the 4 GiB file size limit.")
+					self._file.write(samples)
+					self.frames += len(samples)
+				except Exception as exception:
+					failed = True
+					self._fail(f"Cannot write recording: {exception}")
+		finally:
+			try:
+				self._file.close()
+			except (OSError, sf.SoundFileError) as exception:
+				self._fail(f"Cannot finalize recording: {exception}")
+
+	def stop(self) -> None:
+		with self._lock:
+			if self._closed:
+				return
+			self._closed = True
+			self._accepting = False
+		self._queue.put(None)
+		self._thread.join()
+		if self._append_duration:
+			seconds = self.frames // self._sample_rate
+			minutes, seconds = divmod(seconds, 60)
+			hours, minutes = divmod(minutes, 60)
+			duration = f"{hours:02d}{minutes:02d}{seconds:02d}"
+			try:
+				path = reserve_recording_path(self.path.parent, self.path.stem.removesuffix("_recording"), duration)
+				try:
+					self.path.replace(path)
+				except OSError:
+					path.unlink(missing_ok=True)
+					raise
+				self.path = path
+			except OSError as exception:
+				self._fail(f"Cannot name recording: {exception}")
+
+
 def query_input_devices() -> list[InputDevice]:
 	host_apis = sd.query_hostapis()
 	devices = []
@@ -194,6 +346,7 @@ class AudioCapture:
 		self.stream: sd.InputStream | None = None
 		self.buffer: CaptureBuffer | None = None
 		self.settings: AudioSettings | None = None
+		self.recorder: AudioRecorder | None = None
 
 	def start(self, device: InputDevice, settings: AudioSettings) -> None:
 		self.stop()
@@ -232,7 +385,25 @@ class AudioCapture:
 		self.buffer = buffer
 		self.settings = settings
 
+	def start_recording(self, path: Path, *, append_duration: bool = False) -> None:
+		if self.stream is None or self.buffer is None or self.settings is None:
+			raise ValueError("Start audio capture before recording.")
+		if self.recorder is not None:
+			raise ValueError("A recording is already in progress.")
+		recorder = AudioRecorder(path, self.settings, append_duration=append_duration)
+		self.buffer.set_recorder(recorder)
+		self.recorder = recorder
+
+	def stop_recording(self) -> AudioRecorder | None:
+		recorder, self.recorder = self.recorder, None
+		if self.buffer is not None:
+			self.buffer.set_recorder(None)
+		if recorder is not None:
+			recorder.stop()
+		return recorder
+
 	def stop(self) -> None:
+		self.stop_recording()
 		stream, self.stream = self.stream, None
 		if stream is not None:
 			def close_stream() -> None:
@@ -617,13 +788,16 @@ class MainWindow(QMainWindow):
 		refresh.clicked.connect(self.refresh_devices)
 		device_row.addWidget(refresh)
 		self.start_button = QPushButton("Start")
+		self.start_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+		self.start_button.setMinimumWidth(self.start_button.sizeHint().width())
 		self.start_button.clicked.connect(self._toggle_capture)
-		device_row.addWidget(self.start_button)
+		self.record_checkbox = QCheckBox("Record")
+		self.record_checkbox.setToolTip("Save all input channels as 32-bit floating-point WAV files during capture.")
+		self.record_checkbox.toggled.connect(self._recording_toggled)
 		self.reset_button = QPushButton("Reset peaks")
 		self.reset_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogResetButton))
 		self.reset_button.setToolTip("Reset level and spectrum peaks and measured time; retain current readings.")
 		self.reset_button.clicked.connect(self._reset_measurement)
-		device_row.addWidget(self.reset_button)
 		control_layout.addLayout(device_row)
 		parameters = QGridLayout()
 		parameters.setHorizontalSpacing(12)
@@ -657,12 +831,20 @@ class MainWindow(QMainWindow):
 		self.commands_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
 		self.commands_button.clicked.connect(self._configure_all_commands)
 		self.commands_button.setMinimumWidth(self.commands_button.sizeHint().width())
-		parameters.addWidget(self.commands_button, 0, 4, Qt.AlignmentFlag.AlignRight)
+		device_row.addWidget(self.commands_button)
+		recording_options = QHBoxLayout()
+		recording_options.addWidget(self.record_checkbox)
+		recording_options.addStretch()
+		recording_options.addWidget(self.reset_button)
+		parameters.addLayout(recording_options, 0, 4)
 		self.apply_button = QPushButton("Apply")
 		self.apply_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
 		self.apply_button.setToolTip("Apply capture settings and start a new measurement.")
 		self.apply_button.clicked.connect(self.start_capture)
-		parameters.addWidget(self.apply_button, 1, 4, Qt.AlignmentFlag.AlignRight)
+		capture_actions = QHBoxLayout()
+		capture_actions.addWidget(self.start_button, 1)
+		capture_actions.addWidget(self.apply_button, 1)
+		parameters.addLayout(capture_actions, 1, 4)
 		control_layout.addLayout(parameters)
 		layout.addWidget(controls)
 		self.setMinimumWidth(max(self.minimumWidth(), controls.minimumSizeHint().width()))
@@ -752,6 +934,50 @@ class MainWindow(QMainWindow):
 		self.start_button.setText("Stop" if running else "Start")
 		icon = QStyle.StandardPixmap.SP_MediaStop if running else QStyle.StandardPixmap.SP_MediaPlay
 		self.start_button.setIcon(self.style().standardIcon(icon))
+		self.record_checkbox.setEnabled(not running and self.device_combo.count() > 0)
+
+	def _recording_toggled(self, enabled: bool) -> None:
+		if not enabled:
+			return
+		try:
+			directory = recording_directory()
+		except OSError as exception:
+			with QSignalBlocker(self.record_checkbox):
+				self.record_checkbox.setChecked(False)
+			self._show_notice(f"Cannot enable recording: {exception}")
+			return
+		self.record_checkbox.setToolTip(f"Save 32-bit floating-point WAV files to {directory}")
+
+	def _start_recording(self) -> None:
+		path: Path | None = None
+		try:
+			directory = recording_directory()
+			path = new_recording_path(directory, self.device_combo.currentText())
+			self.capture.start_recording(path, append_duration=True)
+		except (OSError, ValueError, sf.SoundFileError) as exception:
+			if path is not None:
+				try:
+					path.unlink(missing_ok=True)
+				except OSError:
+					pass
+			with QSignalBlocker(self.record_checkbox):
+				self.record_checkbox.setChecked(False)
+			self._show_notice(f"Cannot start recording: {exception}")
+			return
+		self.record_checkbox.setToolTip(f"Recording: {path}")
+
+	def _stop_recording(self) -> None:
+		recorder = self.capture.stop_recording()
+		if recorder is None:
+			return
+		if recorder.error:
+			with QSignalBlocker(self.record_checkbox):
+				self.record_checkbox.setChecked(False)
+			message = f"Recording incomplete: {recorder.error} File: {recorder.path}"
+			self._show_notice(message)
+		else:
+			message = f"Recording saved: {recorder.path}"
+		self.record_checkbox.setToolTip(message)
 
 	def _frequency_minimum_changed(self, minimum: int) -> None:
 		if minimum >= self.frequency_maximum.value():
@@ -855,7 +1081,7 @@ class MainWindow(QMainWindow):
 				self.device_combo.setCurrentIndex(selected_row)
 		for widget in (
 			self.device_combo, self.sample_rate, self.channel_count, self.fft_size,
-			self.latency, self.apply_button, self.start_button, self.reset_button,
+			self.latency, self.apply_button, self.start_button, self.reset_button, self.record_checkbox,
 		):
 			widget.setEnabled(bool(devices))
 		if devices:
@@ -905,8 +1131,11 @@ class MainWindow(QMainWindow):
 		self.state_label.setText(
 			f"Live | {settings.sample_rate:,.0f} Hz | {settings.channels} ch | {settings.block_size:,} samples"
 		)
+		if self.record_checkbox.isChecked():
+			self._start_recording()
 
 	def _stop_capture(self) -> None:
+		self._stop_recording()
 		self.capture.stop()
 		self._set_running(False)
 		self.state_label.setText("Stopped")
@@ -918,6 +1147,9 @@ class MainWindow(QMainWindow):
 			self.start_capture()
 
 	def _update_measurement(self) -> None:
+		recorder = self.capture.recorder
+		if recorder is not None and recorder.error:
+			self._stop_recording()
 		stream = self.capture.stream
 		if stream is None:
 			return
@@ -1067,8 +1299,7 @@ class MainWindow(QMainWindow):
 
 	def closeEvent(self, event: QCloseEvent) -> None:
 		self.timer.stop()
-		self.icon_animator.set_running(False)
-		self.capture.stop()
+		self._stop_capture()
 		self.settings.setValue("window/geometry", self.saveGeometry())
 		self.settings.setValue("window/splitter", self.splitter.saveState())
 		super().closeEvent(event)
@@ -1096,6 +1327,8 @@ def configure_application(application: QApplication) -> None:
 		(QPalette.ColorRole.ToolTipText, "#26343b"),
 	):
 		palette.setColor(role, QColor(color))
+	for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText):
+		palette.setColor(QPalette.ColorGroup.Disabled, role, QColor("#8a8a8a"))
 	application.setPalette(palette)
 	application.setStyleSheet("""
 		QWidget#controls { background: #ffffff; border-bottom: 1px solid #d9e1e5; }
