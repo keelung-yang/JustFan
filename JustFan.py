@@ -62,7 +62,7 @@ pg.setConfigOptions(
 	antialias=False,
 )
 
-VERSION = "1.6"
+VERSION = "1.6.1"
 DB_FLOOR = -120.0
 DEFAULT_MAX_CHANNELS = 8
 FFT_SIZES = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
@@ -712,6 +712,7 @@ class SpectrumPanel(QScrollArea):
 		self.columns = 0
 		self._empty: QLabel | None = None
 		self.frequency_range = (0, 10_000)
+		self._nyquist = 0.0
 		self.setWidgetResizable(True)
 		self.setFrameShape(QFrame.Shape.NoFrame)
 		self.content = QWidget()
@@ -722,6 +723,7 @@ class SpectrumPanel(QScrollArea):
 
 	def set_channels(self, count: int, sample_rate: float) -> None:
 		self._focused_plot = None
+		self._nyquist = sample_rate / 2
 		for plot in self.plots:
 			self.grid.removeWidget(plot)
 			plot.hide()
@@ -858,6 +860,14 @@ class SpectrumPanel(QScrollArea):
 					self._waterfall_start, -self.waterfall.seconds,
 					self._waterfall_bin_width * data.shape[1], self.waterfall.seconds,
 				)
+
+	def reset_zoom(self) -> None:
+		self._spectrum_y_ranges = [(DB_FLOOR - 5, 0)] * len(self.plots)
+		minimum, maximum = self.frequency_range
+		frequency_range = (min(minimum, self._nyquist - 1), min(maximum, self._nyquist))
+		vertical_range = (-self.waterfall.seconds, 0) if self._waterfall_visible else (DB_FLOOR - 5, 0)
+		for plot in self.plots:
+			plot.getViewBox().setRange(xRange=frequency_range, yRange=vertical_range, padding=0)
 
 	def set_frequency_range(self, minimum: int, maximum: int) -> None:
 		self.frequency_range = (minimum, maximum)
@@ -1144,8 +1154,14 @@ class MainWindow(QMainWindow):
 		self.frequency_maximum.setToolTip("Maximum frequency shown in the spectrum.")
 		frequency_heading.addWidget(self.frequency_maximum)
 		frequency_heading.addStretch()
+		self.reset_zoom_button = QPushButton("Reset zoom")
+		self.reset_zoom_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogResetButton))
+		self.reset_zoom_button.setToolTip("Reset zoom for all channels to the selected frequency range and default vertical scale.")
+		self.reset_zoom_button.setAccessibleName("Reset zoom")
+		frequency_heading.addWidget(self.reset_zoom_button)
 		right_layout.addLayout(frequency_heading)
 		self.spectra = SpectrumPanel()
+		self.reset_zoom_button.clicked.connect(self.spectra.reset_zoom)
 		self.view_tabs.currentChanged.connect(self._spectrum_view_changed)
 		self.history_seconds.valueChanged.connect(self._history_seconds_changed)
 		self.peak_hold_checkbox.toggled.connect(self.spectra.set_peak_hold_visible)
@@ -1290,6 +1306,7 @@ class MainWindow(QMainWindow):
 			self.channel_layout.addWidget(widget)
 			self.channel_widgets.append(widget)
 		self.commands_button.setEnabled(count > 0)
+		self.reset_zoom_button.setEnabled(count > 0)
 		if self.channel_widgets:
 			minimum_width = self.channel_widgets[0].minimumSizeHint().width() + 24
 			minimum_width += self.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)

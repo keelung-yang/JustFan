@@ -1300,6 +1300,79 @@ class InterfaceTests(unittest.TestCase):
         self.window.history_seconds.setValue(60)
         self.assertEqual(self.window.spectra.plots, [])
 
+    def test_reset_zoom_restores_all_spectra_without_resetting_measurement(self) -> None:
+        self.assertIsInstance(self.window.reset_zoom_button, type(self.window.reset_button))
+        self.assertEqual(self.window.reset_zoom_button.text(), "Reset zoom")
+        self.assertFalse(self.window.reset_zoom_button.icon().isNull())
+        self.push(0.5)
+        self.push(0.25)
+        self.window.frequency_minimum.setValue(1000)
+        self.window.frequency_maximum.setValue(8000)
+        self.window.channel_widgets[1].enabled_checkbox.setChecked(False)
+        panel = self.window.spectra
+        stream = self.window.capture.stream
+        buffer = self.window.capture.buffer
+        assert buffer is not None and panel.waterfall.data is not None
+        before = buffer.snapshot()
+        assert before is not None
+        history = panel.waterfall.data.copy()
+        for plot in panel.plots:
+            view = plot.getViewBox()
+            for factor in (0.5, 1.5, 0.6):
+                view.scaleBy((factor, factor))
+            view.setRange(xRange=(2000, 4000), yRange=(-60, -20), padding=0)
+        self.window.reset_zoom_button.click()
+        for plot in panel.plots:
+            self.assertEqual(plot.getViewBox().viewRange(), [[1000, 8000], [justfan.DB_FLOOR - 5, 0]])
+        self.assertEqual([plot.isHidden() for plot in panel.plots], [False, True])
+        self.assertEqual((self.window.frequency_minimum.value(), self.window.frequency_maximum.value()), (1000, 8000))
+        self.assertIs(self.window.capture.stream, stream)
+        after = buffer.snapshot()
+        assert after is not None
+        self.assertEqual(after.frames, before.frames)
+        np.testing.assert_array_equal(after.peaks, before.peaks)
+        np.testing.assert_array_equal(after.spectrum_peaks, before.spectrum_peaks)
+        np.testing.assert_array_equal(panel.waterfall.data, history)
+
+    def test_reset_zoom_restores_waterfall_and_cached_spectrum_scale_while_stopped(self) -> None:
+        panel = self.window.spectra
+        for plot in panel.plots:
+            plot.getViewBox().setRange(yRange=(-90, -15), padding=0)
+        self.window.view_tabs.setCurrentIndex(1)
+        self.window.history_seconds.setValue(30)
+        self.window.frequency_minimum.setValue(500)
+        self.window.frequency_maximum.setValue(9000)
+        self.push(0.5)
+        self.window._stop_capture()
+        assert panel.waterfall.data is not None
+        history = panel.waterfall.data.copy()
+        for plot in panel.plots:
+            plot.getViewBox().setRange(xRange=(2000, 3500), yRange=(-8, -2), padding=0)
+        self.window.reset_zoom_button.click()
+        for plot in panel.plots:
+            self.assertEqual(plot.getViewBox().viewRange(), [[500, 9000], [-30, 0]])
+        np.testing.assert_array_equal(panel.waterfall.data, history)
+        self.assertIsNone(self.window.capture.stream)
+        self.window.view_tabs.setCurrentIndex(0)
+        for plot in panel.plots:
+            self.assertEqual(plot.getViewBox().viewRange(), [[500, 9000], [justfan.DB_FLOOR - 5, 0]])
+
+    def test_reset_zoom_caps_frequency_range_at_nyquist(self) -> None:
+        panel = justfan.SpectrumPanel()
+        self.addCleanup(panel.close)
+        panel.set_frequency_range(1000, 10_000)
+        panel.set_channels(1, 16000)
+        panel.plots[0].getViewBox().setRange(xRange=(2000, 4000), yRange=(-80, -20), padding=0)
+        panel.reset_zoom()
+        self.assertEqual(panel.plots[0].getViewBox().viewRange(), [[1000, 8000], [justfan.DB_FLOOR - 5, 0]])
+
+    def test_reset_zoom_is_disabled_without_input_devices(self) -> None:
+        self.assertTrue(self.window.reset_zoom_button.isEnabled())
+        self.query.return_value = []
+        self.window.refresh_devices()
+        self.assertFalse(self.window.reset_zoom_button.isEnabled())
+        self.window.spectra.reset_zoom()
+
     def test_spectrum_defaults_to_frequency_range_up_to_10_khz(self) -> None:
         self.assertEqual(self.window.spectra.plots[0].getViewBox().viewRange()[0], [0, 10_000])
 
