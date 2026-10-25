@@ -7,6 +7,7 @@ import signal
 import sys
 import unicodedata
 import xml.etree.ElementTree as ET
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
@@ -47,6 +48,7 @@ from PySide6.QtWidgets import (
 	QSplitter,
 	QStackedWidget,
 	QStyle,
+	QTabBar,
 	QTableWidget,
 	QTableWidgetItem,
 	QToolButton,
@@ -60,7 +62,7 @@ pg.setConfigOptions(
 	antialias=False,
 )
 
-VERSION = "1.5"
+VERSION = "1.6"
 DB_FLOOR = -120.0
 DEFAULT_MAX_CHANNELS = 8
 FFT_SIZES = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
@@ -129,6 +131,46 @@ class SpectrumAnalyzer:
 		return to_dbfs(amplitudes)
 
 
+class WaterfallHistory:
+	ROWS = 300
+	MAX_BINS = 2048
+
+	def __init__(self, channels: int, seconds: int = 15) -> None:
+		self.channels = channels
+		self.seconds = seconds
+		self.data: np.ndarray | None = None
+		self._latest_row = -1
+		self._last_frame = -1
+
+	@classmethod
+	def compress(cls, spectrum: np.ndarray) -> np.ndarray:
+		stride = max(1, math.ceil(len(spectrum) / cls.MAX_BINS))
+		return np.maximum.reduceat(spectrum, np.arange(0, len(spectrum), stride), axis=0).astype(np.float32)
+
+	def append(self, levels: np.ndarray, frames: int, block_size: int, sample_rate: float) -> None:
+		if frames <= self._last_frame:
+			return
+		if self.data is None:
+			self.data = np.full((self.ROWS, *levels.shape), DB_FLOOR, dtype=np.float32)
+		duration = sample_rate * self.seconds
+		first = max(0, math.floor((frames - block_size) * self.ROWS / duration))
+		last = max(first, math.ceil(frames * self.ROWS / duration) - 1)
+		if last - self._latest_row >= self.ROWS:
+			self.data.fill(DB_FLOOR)
+		elif last > self._latest_row:
+			self.data[np.arange(self._latest_row + 1, last + 1) % self.ROWS] = DB_FLOOR
+		indices = np.arange(max(first, last - self.ROWS + 1), last + 1) % self.ROWS
+		self.data[indices] = np.maximum(self.data[indices], levels)
+		self._latest_row = last
+		self._last_frame = frames
+
+	def image(self, channel: int) -> np.ndarray | None:
+		if self.data is None:
+			return None
+		indices = (np.arange(self.ROWS) + self._latest_row + 1) % self.ROWS
+		return self.data[indices, :, channel]
+
+
 @dataclass(frozen=True)
 class AudioFrame:
 	samples: np.ndarray
@@ -138,10 +180,13 @@ class AudioFrame:
 	warning: str
 	spectrum: np.ndarray | None = None
 	spectrum_peaks: np.ndarray | None = None
+	spectrum_history: tuple[tuple[int, np.ndarray], ...] = ()
 
 
 class CaptureBuffer:
 	"""Keep current readings and every block's level and spectrum peaks."""
+
+	MAX_HISTORY_BLOCKS = 128
 
 	def __init__(self, channels: int, analyzer: SpectrumAnalyzer | None = None) -> None:
 		self._lock = Lock()
@@ -151,6 +196,7 @@ class CaptureBuffer:
 		self._peaks = np.full(channels, DB_FLOOR)
 		self._spectrum: np.ndarray | None = None
 		self._spectrum_peaks: np.ndarray | None = None
+		self._spectrum_history: deque[tuple[int, np.ndarray]] = deque(maxlen=self.MAX_HISTORY_BLOCKS)
 		self._frames = 0
 		self._warning = ""
 		self._recorder: "AudioRecorder | None" = None
@@ -159,6 +205,7 @@ class CaptureBuffer:
 		samples = samples.copy()
 		levels = to_dbfs(np.sqrt(np.mean(np.square(samples, dtype=np.float64), axis=0)))
 		spectrum = self._analyzer.analyze(samples) if self._analyzer is not None else None
+		history_row = WaterfallHistory.compress(spectrum) if spectrum is not None else None
 		with self._lock:
 			self._samples = samples
 			self._levels = levels
@@ -167,6 +214,8 @@ class CaptureBuffer:
 			if spectrum is not None:
 				self._spectrum_peaks = spectrum if self._spectrum_peaks is None else np.maximum(self._spectrum_peaks, spectrum)
 			self._frames += len(samples)
+			if history_row is not None:
+				self._spectrum_history.append((self._frames, history_row))
 			if warning:
 				self._warning = warning
 			if self._recorder is not None:
@@ -188,6 +237,7 @@ class CaptureBuffer:
 				self._warning,
 				self._spectrum.copy() if self._spectrum is not None else None,
 				self._spectrum_peaks.copy() if self._spectrum_peaks is not None else None,
+				tuple(self._spectrum_history),
 			)
 
 	def reset_peaks(self) -> None:
@@ -196,6 +246,9 @@ class CaptureBuffer:
 			self._spectrum_peaks = self._spectrum.copy() if self._spectrum is not None else None
 			self._frames = 0
 			self._warning = ""
+			self._spectrum_history.clear()
+			if self._spectrum is not None:
+				self._spectrum_history.append((0, WaterfallHistory.compress(self._spectrum)))
 
 
 @dataclass(frozen=True)
@@ -580,7 +633,7 @@ class ChannelWidget(QFrame):
 		self.enabled_checkbox = QCheckBox(f"Channel {channel + 1:02d}")
 		self.enabled_checkbox.setChecked(True)
 		self.enabled_checkbox.setStyleSheet(f"color: {CHANNEL_COLORS[channel % len(CHANNEL_COLORS)]}; font-weight: 600;")
-		self.enabled_checkbox.setToolTip("Show this channel in the noise spectrum.")
+		self.enabled_checkbox.setToolTip("Show this channel in the spectrum and waterfall.")
 		self.enabled_checkbox.toggled.connect(self._request_enabled_change)
 		self.commands_button = QToolButton()
 		self.commands_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
@@ -646,6 +699,14 @@ class SpectrumPanel(QScrollArea):
 		self.curves = []
 		self.peak_curves = []
 		self._peak_hold_visible = True
+		self._waterfall_visible = False
+		self.waterfall = WaterfallHistory(0)
+		self.waterfall_images: list[pg.ImageItem] = []
+		self.waterfall_color_bars: list[pg.ColorBarItem] = []
+		self._waterfall_bin_width = 1.0
+		self._waterfall_start = 0.0
+		self._waterfall_update: tuple[np.ndarray, tuple[tuple[int, np.ndarray], ...], int, float] | None = None
+		self._spectrum_y_ranges: list[tuple[float, float]] = []
 		self._enabled_channels: list[bool] = []
 		self._focused_plot: pg.PlotWidget | None = None
 		self.columns = 0
@@ -673,6 +734,11 @@ class SpectrumPanel(QScrollArea):
 		self.plots.clear()
 		self.curves.clear()
 		self.peak_curves.clear()
+		self.waterfall_images.clear()
+		self.waterfall_color_bars.clear()
+		self.waterfall = WaterfallHistory(count, self.waterfall.seconds)
+		self._waterfall_update = None
+		self._spectrum_y_ranges = [(DB_FLOOR - 5, 0)] * count
 		self._enabled_channels = [True] * count
 		self.columns = 0
 		self._empty = None
@@ -714,10 +780,84 @@ class SpectrumPanel(QScrollArea):
 				trace.setDownsampling(auto=True, method="peak")
 				trace.setClipToView(True)
 			peak_curve.setVisible(self._peak_hold_visible)
+			image = pg.ImageItem(axisOrder="row-major")
+			plot.addItem(image)
+			color_bar = pg.ColorBarItem(
+				values=(DB_FLOOR, 0), width=10, colorMap=pg.colormap.get("inferno"), label="dBFS", interactive=False,
+			)
+			color_bar.setImageItem(image, insert_in=plot.plotItem)
+			self.waterfall_images.append(image)
+			self.waterfall_color_bars.append(color_bar)
 			self.plots.append(plot)
 			self.curves.append(curve)
 			self.peak_curves.append(peak_curve)
+		self._configure_views()
 		self._reflow()
+
+	def _configure_views(self) -> None:
+		for channel, plot in enumerate(self.plots):
+			visible = self._waterfall_visible
+			plot.setLabel("left", "History" if visible else "RMS amplitude", units="s" if visible else "dBFS")
+			plot.setLimits(yMin=-self.waterfall.seconds if visible else DB_FLOOR - 10, yMax=0 if visible else 12)
+			limits = (-self.waterfall.seconds, 0) if visible else self._spectrum_y_ranges[channel]
+			plot.getViewBox().setRange(yRange=limits, padding=0)
+			self.curves[channel].setVisible(not visible)
+			self.peak_curves[channel].setVisible(not visible and self._peak_hold_visible)
+			plot_item = plot.plotItem
+			legend = plot_item.legend if plot_item is not None else None
+			if legend is not None:
+				legend.setVisible(not visible)
+			self.waterfall_images[channel].setVisible(visible)
+			self.waterfall_color_bars[channel].setVisible(visible)
+
+	def set_waterfall_visible(self, visible: bool) -> None:
+		if visible == self._waterfall_visible:
+			return
+		if visible:
+			self._spectrum_y_ranges = [tuple(plot.getViewBox().viewRange()[1]) for plot in self.plots]
+		self._waterfall_visible = visible
+		self._configure_views()
+		self._refresh_waterfall()
+
+	def reset_waterfall(self) -> None:
+		self.waterfall = WaterfallHistory(len(self.plots), self.waterfall.seconds)
+		for image in self.waterfall_images:
+			image.clear()
+
+	def set_history_seconds(self, seconds: int) -> None:
+		if seconds == self.waterfall.seconds:
+			return
+		self.waterfall.seconds = seconds
+		self.reset_waterfall()
+		if self._waterfall_visible:
+			self._configure_views()
+		if self._waterfall_update is not None:
+			self.update_waterfall(*self._waterfall_update)
+
+	def update_waterfall(
+		self, frequencies: np.ndarray, history: tuple[tuple[int, np.ndarray], ...], block_size: int, sample_rate: float,
+	) -> None:
+		self._waterfall_update = (frequencies, history, block_size, sample_rate)
+		spacing = float(frequencies[1] - frequencies[0])
+		self._waterfall_start = float(frequencies[0]) - spacing / 2
+		self._waterfall_bin_width = spacing * max(1, math.ceil(len(frequencies) / WaterfallHistory.MAX_BINS))
+		for frames, levels in history:
+			self.waterfall.append(levels, frames, block_size, sample_rate)
+		self._refresh_waterfall()
+
+	def _refresh_waterfall(self) -> None:
+		if not self._waterfall_visible:
+			return
+		for channel, image in enumerate(self.waterfall_images):
+			if not self._enabled_channels[channel] or (self._focused_plot is not None and self._focused_plot is not self.plots[channel]):
+				continue
+			data = self.waterfall.image(channel)
+			if data is not None:
+				image.setImage(data, autoLevels=False, levels=(DB_FLOOR, 0))
+				image.setRect(
+					self._waterfall_start, -self.waterfall.seconds,
+					self._waterfall_bin_width * data.shape[1], self.waterfall.seconds,
+				)
 
 	def set_frequency_range(self, minimum: int, maximum: int) -> None:
 		self.frequency_range = (minimum, maximum)
@@ -738,7 +878,7 @@ class SpectrumPanel(QScrollArea):
 			return
 		self._peak_hold_visible = visible
 		for plot, curve in zip(self.plots, self.peak_curves):
-			curve.setVisible(visible)
+			curve.setVisible(visible and not self._waterfall_visible)
 			if visible:
 				plot.plotItem.legend.addItem(curve, "Peak hold")
 			else:
@@ -761,7 +901,6 @@ class SpectrumPanel(QScrollArea):
 	def _reflow(self) -> None:
 		if not self.plots:
 			return
-		self.content.setMinimumHeight(self.viewport().height())
 		enabled_plots = [plot for plot, enabled in zip(self.plots, self._enabled_channels) if enabled]
 		plots = [self._focused_plot] if self._focused_plot is not None else enabled_plots
 		available_width = max(1, self.viewport().width() - 24)
@@ -774,6 +913,7 @@ class SpectrumPanel(QScrollArea):
 			max(1, round(math.sqrt(len(plots) * aspect_ratio / 1.5))),
 		)
 		if columns == self.columns:
+			self.content.setMinimumHeight(max(self.viewport().height(), self.grid.minimumSize().height()))
 			return
 		while self.grid.count():
 			self.grid.takeAt(0)
@@ -798,6 +938,8 @@ class SpectrumPanel(QScrollArea):
 		for row in range(math.ceil(len(plots) / columns)):
 			self.grid.setRowStretch(row, 1)
 		self.columns = columns
+		self.content.setMinimumHeight(max(self.viewport().height(), self.grid.minimumSize().height()))
+		self._refresh_waterfall()
 
 	def resizeEvent(self, event: QResizeEvent) -> None:
 		super().resizeEvent(event)
@@ -872,7 +1014,7 @@ class MainWindow(QMainWindow):
 		self.record_checkbox.toggled.connect(self._recording_toggled)
 		self.reset_button = QPushButton("Reset peaks")
 		self.reset_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogResetButton))
-		self.reset_button.setToolTip("Reset level and spectrum peaks and measured time; retain current readings.")
+		self.reset_button.setToolTip("Reset level and spectrum peaks, waterfall history and measured time; retain current readings.")
 		self.reset_button.clicked.connect(self._reset_measurement)
 		control_layout.addLayout(device_row)
 		parameters = QGridLayout()
@@ -961,29 +1103,51 @@ class MainWindow(QMainWindow):
 		right_layout.setContentsMargins(0, 0, 0, 0)
 		chart_heading = QHBoxLayout()
 		chart_heading.setContentsMargins(12, 12, 12, 0)
-		chart_heading.addWidget(QLabel("Noise spectrum"))
-		chart_heading.addWidget(QLabel("Range"))
+		self.view_tabs = QTabBar()
+		self.view_tabs.setObjectName("spectrumViews")
+		self.view_tabs.setExpanding(False)
+		self.view_tabs.addTab("Spectrum")
+		self.view_tabs.addTab("Waterfall")
+		chart_heading.addWidget(self.view_tabs)
+		chart_heading.addStretch()
+		self.peak_hold_checkbox = QCheckBox("Peak hold")
+		self.peak_hold_checkbox.setChecked(True)
+		self.peak_hold_checkbox.setToolTip("Show the highest level at each frequency since measurement start or the last peak reset.")
+		chart_heading.addWidget(self.peak_hold_checkbox)
+		self.history_label = QLabel("History")
+		self.history_seconds = QSpinBox()
+		self.history_seconds.setRange(5, 120)
+		self.history_seconds.setSingleStep(5)
+		self.history_seconds.setValue(15)
+		self.history_seconds.setSuffix(" s")
+		self.history_seconds.setToolTip("Time span shown in the waterfall.")
+		chart_heading.addWidget(self.history_label)
+		chart_heading.addWidget(self.history_seconds)
+		self.history_label.hide()
+		self.history_seconds.hide()
+		right_layout.addLayout(chart_heading)
+		frequency_heading = QHBoxLayout()
+		frequency_heading.setContentsMargins(12, 0, 12, 0)
+		frequency_heading.addWidget(QLabel("Range"))
 		maximum_frequency = int(self.sample_rate.maximum() / 2)
 		self.frequency_minimum = QSpinBox()
 		self.frequency_minimum.setRange(0, maximum_frequency - 1)
 		self.frequency_minimum.setValue(0)
 		self.frequency_minimum.setSuffix(" Hz")
 		self.frequency_minimum.setToolTip("Minimum frequency shown in the spectrum.")
-		chart_heading.addWidget(self.frequency_minimum)
-		chart_heading.addWidget(QLabel("to"))
+		frequency_heading.addWidget(self.frequency_minimum)
+		frequency_heading.addWidget(QLabel("to"))
 		self.frequency_maximum = QSpinBox()
 		self.frequency_maximum.setRange(1, maximum_frequency)
 		self.frequency_maximum.setValue(10_000)
 		self.frequency_maximum.setSuffix(" Hz")
 		self.frequency_maximum.setToolTip("Maximum frequency shown in the spectrum.")
-		chart_heading.addWidget(self.frequency_maximum)
-		chart_heading.addStretch()
-		self.peak_hold_checkbox = QCheckBox("Peak hold")
-		self.peak_hold_checkbox.setChecked(True)
-		self.peak_hold_checkbox.setToolTip("Show the highest level at each frequency since measurement start or the last peak reset.")
-		chart_heading.addWidget(self.peak_hold_checkbox)
-		right_layout.addLayout(chart_heading)
+		frequency_heading.addWidget(self.frequency_maximum)
+		frequency_heading.addStretch()
+		right_layout.addLayout(frequency_heading)
 		self.spectra = SpectrumPanel()
+		self.view_tabs.currentChanged.connect(self._spectrum_view_changed)
+		self.history_seconds.valueChanged.connect(self._history_seconds_changed)
 		self.peak_hold_checkbox.toggled.connect(self.spectra.set_peak_hold_visible)
 		self.frequency_minimum.valueChanged.connect(self._frequency_minimum_changed)
 		self.frequency_maximum.valueChanged.connect(self._frequency_maximum_changed)
@@ -1054,6 +1218,16 @@ class MainWindow(QMainWindow):
 		else:
 			message = f"Recording saved: {recorder.path}"
 		self.record_checkbox.setToolTip(message)
+
+	def _spectrum_view_changed(self, index: int) -> None:
+		waterfall = index == 1
+		self.peak_hold_checkbox.setVisible(not waterfall)
+		self.history_label.setVisible(waterfall)
+		self.history_seconds.setVisible(waterfall)
+		self.spectra.set_waterfall_visible(waterfall)
+
+	def _history_seconds_changed(self, seconds: int) -> None:
+		self.spectra.set_history_seconds(seconds)
 
 	def _frequency_minimum_changed(self, minimum: int) -> None:
 		if minimum >= self.frequency_maximum.value():
@@ -1254,6 +1428,7 @@ class MainWindow(QMainWindow):
 			widget.update_levels(float(frame.levels[channel]), float(frame.peaks[channel]))
 		if frame.spectrum is not None and frame.spectrum_peaks is not None:
 			self.spectra.update_spectra(self.analyzer.frequencies, frame.spectrum, frame.spectrum_peaks)
+			self.spectra.update_waterfall(self.analyzer.frequencies, frame.spectrum_history, settings.block_size, settings.sample_rate)
 		seconds = int(frame.frames / settings.sample_rate)
 		hours, remainder = divmod(seconds, 3600)
 		minutes, seconds = divmod(remainder, 60)
@@ -1265,6 +1440,7 @@ class MainWindow(QMainWindow):
 	def _reset_measurement(self) -> None:
 		if self.capture.buffer is not None:
 			self.capture.buffer.reset_peaks()
+			self.spectra.reset_waterfall()
 			self._last_frames = -1
 			self._last_warning = ""
 			self._show_notice()

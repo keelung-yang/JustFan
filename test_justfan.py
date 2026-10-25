@@ -40,6 +40,107 @@ class FakeStream:
         self.closed = True
 
 
+class WaterfallHistoryTests(unittest.TestCase):
+    def test_compression_bounds_memory_and_preserves_narrow_peaks_per_channel(self) -> None:
+        spectrum = np.full((16385, 2), justfan.DB_FLOOR)
+        spectrum[100, 0] = -12
+        spectrum[-1, 1] = -24
+        compressed = justfan.WaterfallHistory.compress(spectrum)
+        self.assertLessEqual(len(compressed), justfan.WaterfallHistory.MAX_BINS)
+        self.assertEqual(compressed.dtype, np.float32)
+        np.testing.assert_array_equal(compressed.max(axis=0), [-12, -24])
+
+    def test_rows_follow_audio_time_and_keep_channels_independent(self) -> None:
+        history = justfan.WaterfallHistory(2, seconds=30)
+        first = np.array([[-12, -24], [-36, -48]], dtype=np.float32)
+        second = first - 6
+        history.append(first, 100, 100, 1000)
+        history.append(second, 200, 100, 1000)
+        for channel in range(2):
+            image = history.image(channel)
+            assert image is not None
+            np.testing.assert_array_equal(image[-2], first[:, channel])
+            np.testing.assert_array_equal(image[-1], second[:, channel])
+            np.testing.assert_array_equal(image[:-2], justfan.DB_FLOOR)
+
+    def test_same_time_slice_holds_peaks_and_ignores_duplicate_frames(self) -> None:
+        history = justfan.WaterfallHistory(1, seconds=30)
+        history.append(np.array([[-12], [-48]]), 25, 25, 1000)
+        history.append(np.array([[-24], [-36]]), 50, 25, 1000)
+        history.append(np.zeros((2, 1)), 50, 25, 1000)
+        image = history.image(0)
+        assert image is not None
+        np.testing.assert_array_equal(image[-1], [-12, -36])
+        np.testing.assert_array_equal(image[:-1], justfan.DB_FLOOR)
+
+    def test_missing_audio_time_is_not_stretched_into_continuous_data(self) -> None:
+        history = justfan.WaterfallHistory(1, seconds=30)
+        history.append(np.array([[-12]]), 100, 100, 1000)
+        history.append(np.array([[-24]]), 400, 100, 1000)
+        image = history.image(0)
+        assert image is not None
+        np.testing.assert_array_equal(image[-4:, 0], [-12, justfan.DB_FLOOR, justfan.DB_FLOOR, -24])
+
+    def test_history_wraps_and_drops_data_older_than_the_window(self) -> None:
+        history = justfan.WaterfallHistory(1, seconds=30)
+        history.append(np.array([[-12]]), 100, 100, 1000)
+        history.append(np.array([[-24]]), 30100, 100, 1000)
+        image = history.image(0)
+        assert image is not None and history.data is not None
+        self.assertEqual(image.shape, (history.ROWS, 1))
+        self.assertEqual(history.data.nbytes, history.ROWS * 4)
+        np.testing.assert_array_equal(image[:-1], justfan.DB_FLOOR)
+        np.testing.assert_array_equal(image[-1], [-24])
+
+    def test_long_fft_blocks_fill_their_real_duration_without_mutating_inputs(self) -> None:
+        history = justfan.WaterfallHistory(1, seconds=30)
+        levels = np.array([[-18]], dtype=np.float32)
+        history.append(levels, 500, 500, 1000)
+        levels.fill(0)
+        image = history.image(0)
+        assert image is not None
+        np.testing.assert_array_equal(image[-5:], -18)
+        np.testing.assert_array_equal(image[:-5], justfan.DB_FLOOR)
+        image.fill(0)
+        fresh = history.image(0)
+        assert fresh is not None
+        np.testing.assert_array_equal(fresh[-5:], -18)
+
+
+    def test_capture_retains_unrendered_spectra_without_consuming_snapshots(self) -> None:
+        analyzer = justfan.SpectrumAnalyzer(48000, 256)
+        buffer = justfan.CaptureBuffer(2, analyzer)
+        first = np.column_stack((np.full(256, 0.5), np.zeros(256)))
+        second = np.column_stack((np.zeros(256), np.full(256, 0.25)))
+        buffer.push(first)
+        buffer.push(second)
+        frame = buffer.snapshot()
+        assert frame is not None
+        self.assertEqual([frames for frames, _ in frame.spectrum_history], [256, 512])
+        for (_, levels), samples in zip(frame.spectrum_history, (first, second)):
+            np.testing.assert_allclose(levels, analyzer.analyze(samples), atol=1e-5)
+        again = buffer.snapshot()
+        assert again is not None
+        self.assertEqual([frames for frames, _ in again.spectrum_history], [256, 512])
+
+    def test_capture_history_is_bounded_and_resets_with_measurement_time(self) -> None:
+        analyzer = justfan.SpectrumAnalyzer(48000, 256)
+        buffer = justfan.CaptureBuffer(1, analyzer)
+        samples = np.full((256, 1), 0.25)
+        for _block in range(buffer.MAX_HISTORY_BLOCKS + 5):
+            buffer.push(samples)
+        frame = buffer.snapshot()
+        assert frame is not None
+        self.assertEqual(len(frame.spectrum_history), buffer.MAX_HISTORY_BLOCKS)
+        self.assertEqual(frame.spectrum_history[0][0], 6 * 256)
+        buffer.reset_peaks()
+        reset = buffer.snapshot()
+        assert reset is not None
+        self.assertEqual(len(reset.spectrum_history), 1)
+        self.assertEqual(reset.spectrum_history[0][0], 0)
+        np.testing.assert_allclose(reset.spectrum_history[0][1], analyzer.analyze(samples), atol=1e-5)
+
+
 class SignalTests(unittest.TestCase):
     def setUp(self) -> None:
         self.sample_rate = 48000
@@ -1077,6 +1178,127 @@ class InterfaceTests(unittest.TestCase):
         with sf.SoundFile(recorder.path) as recording:
             self.assertEqual(recording.samplerate, 48000)
             self.assertEqual(recording.channels, 2)
+
+    def test_waterfall_switch_preserves_capture_and_spectrum_peaks(self) -> None:
+        self.push(0.5)
+        self.push(0.25)
+        stream = self.window.capture.stream
+        panel = self.window.spectra
+        self.assertEqual(self.window.view_tabs.currentIndex(), 0)
+        self.assertTrue(all(not image.isVisible() for image in panel.waterfall_images))
+        self.window.view_tabs.setCurrentIndex(1)
+        self.assertIs(self.window.capture.stream, stream)
+        self.assertFalse(self.window.peak_hold_checkbox.isVisible())
+        self.assertTrue(self.window.history_seconds.isVisible())
+        for channel, image in enumerate(panel.waterfall_images):
+            self.assertTrue(image.isVisible())
+            self.assertIsNotNone(image.image)
+            self.assertFalse(panel.curves[channel].isVisible())
+            self.assertFalse(panel.peak_curves[channel].isVisible())
+            self.assertEqual(panel.waterfall_color_bars[channel].levels(), (justfan.DB_FLOOR, 0))
+            self.assertEqual(panel.plots[channel].getViewBox().viewRange()[1], [-15, 0])
+        self.window.view_tabs.setCurrentIndex(0)
+        self.assertTrue(self.window.peak_hold_checkbox.isVisible())
+        self.assertFalse(self.window.history_seconds.isVisible())
+        self.assertIs(self.window.capture.stream, stream)
+        for channel, held in enumerate(panel.peak_curves):
+            self.assertTrue(held.isVisible())
+            self.assertTrue(panel.curves[channel].isVisible())
+            self.assertFalse(panel.waterfall_images[channel].isVisible())
+            self.assertAlmostEqual(float(held.getData()[1][0]), 20 * np.log10(0.5))
+
+    def test_waterfall_keeps_unrendered_tones_on_separate_channels(self) -> None:
+        settings = self.window.capture.settings
+        stream = self.window.capture.stream
+        assert settings is not None and isinstance(stream, FakeStream)
+        phase = 2 * np.pi * np.arange(settings.block_size) / settings.block_size
+        first = np.column_stack((0.5 * np.sin(32 * phase), np.zeros(settings.block_size)))
+        later = np.column_stack((np.zeros(settings.block_size), 0.25 * np.sin(96 * phase)))
+        stream.callback(first, settings.block_size, None, "")
+        stream.callback(later, settings.block_size, None, "")
+        self.window._update_measurement()
+        self.window.view_tabs.setCurrentIndex(1)
+        images = [image.image for image in self.window.spectra.waterfall_images]
+        assert images[0] is not None and images[1] is not None
+        self.assertAlmostEqual(float(images[0][:, 32].max()), 20 * np.log10(0.5 / np.sqrt(2)), places=3)
+        self.assertAlmostEqual(float(images[1][:, 96].max()), 20 * np.log10(0.25 / np.sqrt(2)), places=3)
+        self.assertLess(float(images[1][:, 32].max()), -90)
+        self.assertLess(float(images[0][:, 96].max()), -90)
+
+    def test_waterfall_duration_stop_reset_and_restart(self) -> None:
+        self.window.view_tabs.setCurrentIndex(1)
+        self.window.history_seconds.setValue(30)
+        self.push(0.5)
+        for plot in self.window.spectra.plots:
+            self.assertEqual(plot.getViewBox().viewRange()[1], [-30, 0])
+        self.push(0.25)
+        self.window._stop_capture()
+        stopped = self.window.spectra.waterfall_images[0].image
+        assert stopped is not None
+        before = stopped.copy()
+        self.window._update_measurement()
+        np.testing.assert_array_equal(self.window.spectra.waterfall_images[0].image, before)
+        self.window.reset_button.click()
+        reset = self.window.spectra.waterfall_images[0].image
+        assert reset is not None
+        self.assertAlmostEqual(float(reset.max()), 20 * np.log10(0.25), places=4)
+        np.testing.assert_array_equal(reset[:-1], justfan.DB_FLOOR)
+        self.window.start_capture()
+        self.assertEqual(self.window.view_tabs.currentIndex(), 1)
+        self.assertEqual(self.window.spectra.waterfall.seconds, 30)
+        self.assertIsNone(self.window.spectra.waterfall_images[0].image)
+        self.push(0.1)
+        restarted = self.window.spectra.waterfall_images[0].image
+        assert restarted is not None
+        self.assertAlmostEqual(float(restarted.max()), -20, places=4)
+
+    def test_waterfall_shares_frequency_range_and_channel_visibility(self) -> None:
+        self.window.view_tabs.setCurrentIndex(1)
+        self.window.frequency_minimum.setValue(1000)
+        self.window.frequency_maximum.setValue(8000)
+        self.window.channel_widgets[0].enabled_checkbox.setChecked(False)
+        self.push(0.5)
+        panel = self.window.spectra
+        self.assertEqual([plot.isVisible() for plot in panel.plots], [False, True])
+        for plot in panel.plots:
+            self.assertEqual(plot.getViewBox().viewRange()[0], [1000, 8000])
+        self.window.channel_widgets[0].enabled_checkbox.setChecked(True)
+        image = panel.waterfall_images[0].image
+        assert image is not None
+        self.assertAlmostEqual(float(image.max()), 20 * np.log10(0.5), places=4)
+
+    def test_waterfall_compact_layout_scrolls_without_clipping_plot_axes(self) -> None:
+        assert self.application is not None
+        self.query.return_value = [justfan.InputDevice(3, "Four-channel microphone", "Test API", 4, 48000, 0.01)]
+        self.window.refresh_devices()
+        self.window.view_tabs.setCurrentIndex(1)
+        self.window.resize(860, 560)
+        self.window.splitter.setSizes([350, 503])
+        self.application.processEvents()
+        panel = self.window.spectra
+        self.assertGreaterEqual(panel.content.height(), panel.grid.minimumSize().height())
+        self.assertTrue(panel.verticalScrollBar().isVisible())
+        self.assertFalse(panel.horizontalScrollBar().isVisible())
+        for index, plot in enumerate(panel.plots):
+            bounds = justfan.QRect(plot.x(), plot.y(), plot.width(), plot.height())
+            self.assertTrue(panel.content.rect().contains(bounds))
+            for other in panel.plots[index + 1:]:
+                self.assertFalse(plot.geometry().intersects(other.geometry()))
+
+    def test_waterfall_view_changes_do_not_replay_previous_device_audio(self) -> None:
+        self.push(0.5)
+        self.window.device_combo.setCurrentIndex(self.window.device_combo.findText(self.devices[1].label, Qt.MatchFlag.MatchEndsWith))
+        self.window.view_tabs.setCurrentIndex(1)
+        self.window.history_seconds.setValue(30)
+        self.assertEqual(self.window._last_frames, -1)
+        self.assertEqual(len(self.window.spectra.plots), 1)
+        self.assertIsNone(self.window.spectra.waterfall_images[0].image)
+        self.query.return_value = []
+        self.window.refresh_devices()
+        self.window.view_tabs.setCurrentIndex(0)
+        self.window.view_tabs.setCurrentIndex(1)
+        self.window.history_seconds.setValue(60)
+        self.assertEqual(self.window.spectra.plots, [])
 
     def test_spectrum_defaults_to_frequency_range_up_to_10_khz(self) -> None:
         self.assertEqual(self.window.spectra.plots[0].getViewBox().viewRange()[0], [0, 10_000])
