@@ -6,7 +6,7 @@ The NOISE is the top priority:
 >
 > The NOISE is acceptable during work.
 >
-> Thus, you can think at your PC without NOISE.
+> Thus, you can think at your PC without NOISE when it should be quiet.
 
 The JustFan aims to help monitor, control, and calibrate your PC’s cooling system.
 
