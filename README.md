@@ -20,6 +20,16 @@ The JustFan aims to help monitor, control, and calibrate your PC’s cooling sys
 - Fan speed control with thermal feedback
 - Automatic thermal calibration
 
+## Screenshots
+
+### Spectrum
+
+![Spectrum view](images/Spectrum.png)
+
+### Waterfall
+
+![Waterfall view](images/Waterfall.png)
+
 ## Requirements
 
 - Python 3.10 or newer
