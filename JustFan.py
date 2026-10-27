@@ -483,8 +483,8 @@ class FanIconAnimator(QObject):
 	def __init__(self, window: QMainWindow) -> None:
 		super().__init__(window)
 		self._window = window
-		self.idle_icon = QIcon(str(Path(__file__).with_name("JustFan.ico")))
-		self.frames = self._load_frames(Path(__file__).with_name("JustFan.svg"))
+		self.idle_icon = QIcon(str(Path(__file__).parent / "images" / "JustFan.ico"))
+		self.frames = self._load_frames(Path(__file__).parent / "images" / "JustFan.svg")
 		self.frame_index = 0
 		self.timer = QTimer(self)
 		self.timer.setInterval(50)
@@ -1577,7 +1577,7 @@ class MainWindow(QMainWindow):
 def configure_application(application: QApplication) -> None:
 	application.setApplicationName("JustFan")
 	application.setOrganizationName("JustFan")
-	application.setWindowIcon(QIcon(str(Path(__file__).with_name("JustFan.ico"))))
+	application.setWindowIcon(QIcon(str(Path(__file__).parent / "images" / "JustFan.ico")))
 	application.setStyle("Fusion")
 	application.setFont(QFont("Segoe UI" if sys.platform == "win32" else "Noto Sans", 10))
 	QPixmapCache.setCacheLimit(max(QPixmapCache.cacheLimit(), 512 * 1024))

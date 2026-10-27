@@ -636,9 +636,9 @@ class PackagingTests(unittest.TestCase):
                 "EXE": build_executable,
             },
         )
-        icon_path = str(project_root / "JustFan.ico")
-        self.assertIn((icon_path, "."), build_analysis.call_args.kwargs.get("datas", []))
-        self.assertIn((str(project_root / "JustFan.svg"), "."), build_analysis.call_args.kwargs.get("datas", []))
+        icon_path = str(project_root / "images" / "JustFan.ico")
+        self.assertIn((icon_path, "images"), build_analysis.call_args.kwargs.get("datas", []))
+        self.assertIn((str(project_root / "images" / "JustFan.svg"), "images"), build_analysis.call_args.kwargs.get("datas", []))
         self.assertEqual(build_executable.call_args.kwargs["icon"], icon_path)
 
 
@@ -868,9 +868,10 @@ class InterfaceTests(unittest.TestCase):
     def test_application_icon_loads_from_bundle_outside_working_directory(self) -> None:
         assert self.application is not None
         bundle = Path(self.directory.name) / "bundle"
-        bundle.mkdir()
-        icon = bundle / "JustFan.ico"
-        icon.write_bytes(Path(justfan.__file__).with_name("JustFan.ico").read_bytes())
+        images = bundle / "images"
+        images.mkdir(parents=True)
+        for filename in ("JustFan.ico", "JustFan.svg"):
+            (images / filename).write_bytes((Path(justfan.__file__).parent / "images" / filename).read_bytes())
         self.addCleanup(justfan.configure_application, self.application)
         self.addCleanup(os.chdir, os.getcwd())
         os.chdir(self.directory.name)
@@ -878,6 +879,9 @@ class InterfaceTests(unittest.TestCase):
             justfan.configure_application(self.application)
             self.assertFalse(self.application.windowIcon().isNull())
             self.assertFalse(self.window.windowIcon().pixmap(24, 24).isNull())
+            animator = justfan.FanIconAnimator(self.window)
+            self.assertFalse(animator.idle_icon.isNull())
+            self.assertEqual(len(animator.frames), animator.POSE_FRAMES + animator.SPIN_FRAMES)
 
     def test_icon_straightens_rotates_and_restores_idle_on_stop(self) -> None:
         assert self.application is not None
