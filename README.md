@@ -14,6 +14,7 @@ The JustFan aims to help monitor, control, and calibrate your PC’s cooling sys
 
 ### Implemented
 - Noise monitoring across audio input channels
+- Fundamental candidates with multi-selection and odd/even harmonic markers
 
 ### Not implemented yet
 - Fan speed monitor

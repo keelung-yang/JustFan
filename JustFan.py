@@ -21,8 +21,10 @@ from urllib.parse import quote
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
+from scipy.ndimage import median_filter
+from scipy.signal import find_peaks
 from PySide6.QtCore import QByteArray, QEvent, QObject, QRect, QRectF, QSettings, QSignalBlocker, QStandardPaths, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QIcon, QImage, QMouseEvent, QPaintEvent, QPainter, QPalette, QPixmap, QPixmapCache, QRegion, QResizeEvent
+from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QHideEvent, QIcon, QImage, QMouseEvent, QPaintEvent, QPainter, QPalette, QPixmap, QPixmapCache, QRegion, QResizeEvent, QShowEvent
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
 	QAbstractItemView,
@@ -62,7 +64,7 @@ pg.setConfigOptions(
 	antialias=False,
 )
 
-VERSION = "1.6.1"
+VERSION = "1.7"
 DB_FLOOR = -120.0
 DEFAULT_MAX_CHANNELS = 8
 FFT_SIZES = (256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
@@ -129,6 +131,115 @@ class SpectrumAnalyzer:
 		if self.size % 2 == 0:
 			amplitudes[-1] /= np.sqrt(2.0)
 		return to_dbfs(amplitudes)
+
+
+@dataclass(frozen=True)
+class HarmonicPeak:
+	order: int
+	frequency: float
+	level: float
+
+
+@dataclass(frozen=True)
+class FundamentalCandidate:
+	frequency: float
+	harmonics: tuple[HarmonicPeak, ...]
+	score: float
+
+	@property
+	def inferred(self) -> bool:
+		return not any(peak.order == 1 for peak in self.harmonics)
+
+
+class HarmonicAnalyzer:
+	MAX_ORDER = 16
+	MAX_PEAKS = 48
+	MAX_CANDIDATES = 8
+
+	def __init__(self, frequencies: np.ndarray) -> None:
+		self.frequencies = frequencies
+		self.spacing = float(frequencies[1] - frequencies[0])
+		self.minimum_frequency = max(20.0, self.spacing * 3)
+
+	def _peaks(self, levels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+		if levels.ndim != 1 or levels.shape != self.frequencies.shape or not np.isfinite(levels).all():
+			raise ValueError("A finite single-channel spectrum matching the frequency bins is required.")
+		background = np.maximum(median_filter(levels, size=31, mode="nearest"), float(np.median(levels[1:])))
+		threshold = np.maximum(background + 14, max(DB_FLOOR + 18, float(levels[1:].max()) - 50))
+		indices, _properties = find_peaks(levels, height=threshold, prominence=8, distance=3)
+		indices = indices[self.frequencies[indices] >= self.minimum_frequency]
+		if len(indices) > self.MAX_PEAKS:
+			indices = np.sort(indices[np.argsort(levels[indices])[-self.MAX_PEAKS:]])
+		left, center, right = levels[indices - 1], levels[indices], levels[indices + 1]
+		curvature = left - 2 * center + right
+		offset = np.divide(0.5 * (left - right), curvature, out=np.zeros_like(center), where=curvature != 0)
+		offset = np.clip(offset, -0.5, 0.5)
+		return self.frequencies[indices] + offset * self.spacing, center - 0.25 * (left - right) * offset
+
+	def _tolerance(self, frequency: float) -> float:
+		return max(self.spacing * 1.25, frequency * 0.003)
+
+	def _match(self, fundamental: float, frequencies: np.ndarray, levels: np.ndarray) -> tuple[HarmonicPeak, ...]:
+		if not len(frequencies):
+			return ()
+		peaks = []
+		for order in range(1, self.MAX_ORDER + 1):
+			target = fundamental * order
+			index = int(np.argmin(np.abs(frequencies - target)))
+			if abs(float(frequencies[index]) - target) <= self._tolerance(target):
+				peaks.append(HarmonicPeak(order, float(frequencies[index]), float(levels[index])))
+		return tuple(peaks)
+
+	def match(self, fundamental: float, levels: np.ndarray) -> tuple[HarmonicPeak, ...]:
+		if not math.isfinite(fundamental) or fundamental < self.minimum_frequency:
+			return ()
+		return self._match(fundamental, *self._peaks(levels))
+
+	def match_selected(self, fundamentals: tuple[float, ...], levels: np.ndarray) -> dict[float, tuple[HarmonicPeak, ...]]:
+		frequencies, peak_levels = self._peaks(levels)
+		return {
+			fundamental: self._match(fundamental, frequencies, peak_levels)
+			for fundamental in fundamentals
+			if math.isfinite(fundamental) and fundamental >= self.minimum_frequency
+		}
+
+	def find_candidates(self, levels: np.ndarray) -> tuple[FundamentalCandidate, ...]:
+		frequencies, peak_levels = self._peaks(levels)
+		if not len(frequencies):
+			return ()
+		seeds = np.unique(frequencies[:, None] / np.arange(1, self.MAX_ORDER + 1))
+		candidates = []
+		for seed in seeds[seeds >= self.minimum_frequency]:
+			harmonics = self._match(float(seed), frequencies, peak_levels)
+			if not harmonics:
+				continue
+			inferred = harmonics[0].order != 1
+			if inferred and (len(harmonics) < 3 or math.gcd(*(peak.order for peak in harmonics)) != 1):
+				continue
+			orders = np.array([peak.order for peak in harmonics])
+			observed = np.array([peak.frequency for peak in harmonics])
+			weights = 10.0 ** ((np.array([peak.level for peak in harmonics]) - peak_levels.max()) / 20)
+			fundamental = float(np.sum(orders * observed * weights) / np.sum(orders ** 2 * weights))
+			harmonics = self._match(fundamental, frequencies, peak_levels)
+			score = sum(10.0 ** ((peak.level - float(peak_levels.max())) / 20) / math.sqrt(peak.order) for peak in harmonics)
+			score += 0.35 * (len(harmonics) - 1) - 0.15 * inferred
+			candidates.append(FundamentalCandidate(fundamental, harmonics, score))
+		selected: list[FundamentalCandidate] = []
+		for candidate in sorted(candidates, key=lambda candidate: candidate.score, reverse=True):
+			if any(abs(candidate.frequency - previous.frequency) <= self._tolerance(candidate.frequency) for previous in selected):
+				continue
+			if any(
+				not previous.inferred
+				and 2 <= round(candidate.frequency / previous.frequency) <= self.MAX_ORDER
+				and abs(candidate.frequency - round(candidate.frequency / previous.frequency) * previous.frequency) <= self._tolerance(candidate.frequency)
+				and all(any(abs(peak.frequency - other.frequency) <= self._tolerance(peak.frequency) for other in previous.harmonics) for peak in candidate.harmonics)
+				for previous in selected
+			):
+				continue
+			selected.append(candidate)
+			if len(selected) == self.MAX_CANDIDATES:
+				break
+		return tuple(selected)
 
 
 class WaterfallHistory:
@@ -692,13 +803,223 @@ class ChannelWidget(QFrame):
 		self.level_meter.set_levels(current, peak)
 
 
+class HarmonicCandidatesPanel(QWidget):
+	identify_requested = Signal()
+	selection_changed = Signal(object)
+	candidate_activated = Signal(int)
+
+	def __init__(self, parent: QWidget) -> None:
+		super().__init__(parent)
+		self.candidates: tuple[tuple[int, FundamentalCandidate], ...] = ()
+		self._sort_column: int | None = None
+		self._sort_order = Qt.SortOrder.AscendingOrder
+		self._running = False
+		self._new_spectrum = False
+		self.auto_timer = QTimer(self)
+		self.auto_timer.setInterval(1000)
+		self.auto_timer.timeout.connect(self._auto_identify)
+		self.setWindowTitle("Fundamental candidates")
+		self.resize(660, 360)
+		layout = QVBoxLayout(self)
+		heading = QHBoxLayout()
+		self.status_label = QLabel("No spectrum")
+		heading.addWidget(self.status_label, 1)
+		self.auto_checkbox = QCheckBox("Auto identify")
+		self.auto_checkbox.setToolTip("Identify fresh spectra every second while this window is open and capture is running.")
+		self.auto_checkbox.setEnabled(False)
+		self.auto_checkbox.toggled.connect(self._sync_auto_timer)
+		heading.addWidget(self.auto_checkbox)
+		self.identify_button = QPushButton("Identify")
+		self.identify_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+		self.identify_button.setToolTip("Merge candidates from the current spectrum, retaining previous entries and selections.")
+		self.identify_button.setEnabled(False)
+		self.identify_button.clicked.connect(self.identify_requested.emit)
+		heading.addWidget(self.identify_button)
+		self.clear_button = QPushButton("Clear")
+		self.clear_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
+		self.clear_button.setToolTip("Clear all candidates and harmonic selections; automatic identification continues with new audio.")
+		self.clear_button.setEnabled(False)
+		self.clear_button.clicked.connect(self.clear_candidates)
+		heading.addWidget(self.clear_button)
+		layout.addLayout(heading)
+		self.table = QTableWidget(0, 4)
+		self.table.setAccessibleName("Fundamental candidates")
+		self.table.setHorizontalHeaderLabels(["Channel", "Base (Hz)", "Matched orders", "Evidence"])
+		self.table.verticalHeader().hide()
+		self.table.setAlternatingRowColors(True)
+		self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+		self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+		self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+		self.table.setWordWrap(False)
+		self.table.horizontalHeader().setSectionsClickable(True)
+		self.table.horizontalHeader().setSortIndicatorShown(False)
+		self.table.horizontalHeader().sectionClicked.connect(self._sort_candidates)
+		for column in (0, 1, 3):
+			self.table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+		self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+		self.table.itemChanged.connect(self._selection_changed)
+		self.table.cellClicked.connect(self._activate_candidate)
+		self.table.cellActivated.connect(self._activate_candidate)
+		layout.addWidget(self.table)
+
+	def set_running(self, running: bool) -> None:
+		self._running = running
+		self.auto_checkbox.setEnabled(running)
+		self._sync_auto_timer()
+
+	def set_spectrum_available(self, available: bool) -> None:
+		self._new_spectrum = available
+		self.identify_button.setEnabled(available)
+		self._sync_auto_timer()
+
+	def _sync_auto_timer(self) -> None:
+		if self.isVisible() and self._running and self.auto_checkbox.isChecked() and self.identify_button.isEnabled():
+			if not self.auto_timer.isActive():
+				self.auto_timer.start()
+				self._auto_identify()
+		else:
+			self.auto_timer.stop()
+
+	def _auto_identify(self) -> None:
+		if (
+			self.isVisible() and self._running and self.auto_checkbox.isChecked()
+			and self.identify_button.isEnabled() and self._new_spectrum
+			and QApplication.mouseButtons() == Qt.MouseButton.NoButton
+		):
+			self.identify_requested.emit()
+
+	def showEvent(self, event: QShowEvent) -> None:
+		super().showEvent(event)
+		self._sync_auto_timer()
+
+	def hideEvent(self, event: QHideEvent) -> None:
+		self.auto_timer.stop()
+		super().hideEvent(event)
+
+	def _sort_candidates(self, column: int) -> None:
+		if self._sort_column == column and self._sort_order == Qt.SortOrder.AscendingOrder:
+			self._sort_order = Qt.SortOrder.DescendingOrder
+		else:
+			self._sort_order = Qt.SortOrder.AscendingOrder
+		self._sort_column = column
+		self.table.horizontalHeader().setSortIndicator(column, self._sort_order)
+		self.table.horizontalHeader().setSortIndicatorShown(True)
+		self.table.sortItems(column, self._sort_order)
+
+	def _activate_candidate(self, row: int, _column: int) -> None:
+		item = self.table.item(row, 0)
+		if item is not None:
+			self.candidate_activated.emit(int(item.data(Qt.ItemDataRole.UserRole)))
+
+	def _checked_candidate_rows(self) -> set[int]:
+		checked_rows = set()
+		for row in range(self.table.rowCount()):
+			item = self.table.item(row, 0)
+			if item is not None and item.checkState() == Qt.CheckState.Checked:
+				checked_rows.add(int(item.data(Qt.ItemDataRole.UserRole)))
+		return checked_rows
+
+	def selected_fundamentals(self) -> dict[int, tuple[float, ...]]:
+		selected: dict[int, tuple[float, ...]] = {}
+		for row in sorted(self._checked_candidate_rows()):
+			channel, candidate = self.candidates[row]
+			selected[channel] = (*selected.get(channel, ()), candidate.frequency)
+		return selected
+
+	def set_candidates(self, candidates: tuple[tuple[int, FundamentalCandidate], ...], spacing: float = 1.0) -> None:
+		selected = self.selected_fundamentals()
+		checked_rows = {
+			row for row, (channel, candidate) in enumerate(candidates)
+			if any(abs(frequency - candidate.frequency) <= max(spacing * 1.25, candidate.frequency * 0.003) for frequency in selected.get(channel, ()))
+		}
+		self._set_candidates(candidates, checked_rows)
+
+	def merge_candidates(self, candidates: tuple[tuple[int, FundamentalCandidate], ...], spacing: float = 1.0) -> None:
+		merged = list(self.candidates)
+		checked_rows = self._checked_candidate_rows()
+		current_rows = set()
+		for channel, candidate in candidates:
+			matches = [
+				(abs(previous.frequency - candidate.frequency), row)
+				for row, (previous_channel, previous) in enumerate(merged)
+				if previous_channel == channel and row not in current_rows
+				and abs(previous.frequency - candidate.frequency) <= max(spacing * 1.25, candidate.frequency * 0.003)
+			]
+			if matches:
+				row = min(matches)[1]
+				merged[row] = (channel, candidate)
+			else:
+				row = len(merged)
+				merged.append((channel, candidate))
+			current_rows.add(row)
+		self._set_candidates(tuple(merged), checked_rows, current_rows)
+
+	def clear_candidates(self) -> None:
+		self.set_candidates(())
+
+	def _set_candidates(
+		self, candidates: tuple[tuple[int, FundamentalCandidate], ...], checked_rows: set[int], current_rows: set[int] | None = None,
+	) -> None:
+		self._new_spectrum = False
+		current = self.table.item(self.table.currentRow(), 0)
+		current_index = int(current.data(Qt.ItemDataRole.UserRole)) if current is not None else -1
+		scroll_position = self.table.verticalScrollBar().value()
+		self.candidates = candidates
+		with QSignalBlocker(self.table):
+			self.table.setRowCount(len(candidates))
+			for row, (channel, candidate) in enumerate(candidates):
+				item = QTableWidgetItem(f"Channel {channel + 1:02d}")
+				item.setData(Qt.ItemDataRole.UserRole, row)
+				item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+				item.setCheckState(Qt.CheckState.Checked if row in checked_rows else Qt.CheckState.Unchecked)
+				self.table.setItem(row, 0, item)
+				frequency = QTableWidgetItem()
+				frequency.setData(Qt.ItemDataRole.DisplayRole, round(candidate.frequency, 2))
+				self.table.setItem(row, 1, frequency)
+				orders = QTableWidgetItem(", ".join(f"H{peak.order}" for peak in candidate.harmonics))
+				orders.setToolTip("\n".join(f"H{peak.order}: {peak.frequency:.2f} Hz, {peak.level:.1f} dBFS" for peak in candidate.harmonics))
+				self.table.setItem(row, 2, orders)
+				evidence = "Inferred H1" if candidate.inferred else "Single peak" if len(candidate.harmonics) == 1 else "H1 observed"
+				retained = current_rows is not None and row not in current_rows
+				evidence_item = QTableWidgetItem("Retained" if retained else evidence)
+				evidence_item.setToolTip(
+					"H1 is absent; inferred from at least three coprime harmonic orders." if candidate.inferred
+					else "Only one peak is observed; no harmonic series is confirmed." if len(candidate.harmonics) == 1
+					else "H1 and higher harmonics are observed."
+				)
+				if retained:
+					evidence_item.setToolTip(f"Last detected: {evidence}. Not matched in the latest identification.")
+				self.table.setItem(row, 3, evidence_item)
+			if self._sort_column is not None:
+				self.table.sortItems(self._sort_column, self._sort_order)
+			for row in range(self.table.rowCount()):
+				item = self.table.item(row, 0)
+				if item is not None and item.data(Qt.ItemDataRole.UserRole) == current_index:
+					self.table.setCurrentCell(row, 0)
+					break
+			self.table.verticalScrollBar().setValue(scroll_position)
+		self.clear_button.setEnabled(bool(candidates))
+		self._selection_changed()
+
+	def _selection_changed(self) -> None:
+		selected = self.selected_fundamentals()
+		count = sum(len(fundamentals) for fundamentals in selected.values())
+		self.status_label.setText(f"{len(self.candidates)} candidates, {count} selected" if self.candidates else "No candidates")
+		self.selection_changed.emit(selected)
+
+
 class SpectrumPanel(QScrollArea):
 	def __init__(self, parent: QWidget | None = None) -> None:
 		super().__init__(parent)
 		self.plots: list[pg.PlotWidget] = []
 		self.curves = []
 		self.peak_curves = []
+		self.harmonic_markers: list[dict[str, pg.ScatterPlotItem]] = []
+		self._selected_fundamentals: dict[int, tuple[float, ...]] = {}
+		self._harmonic_analyzer: HarmonicAnalyzer | None = None
+		self._spectrum_data: tuple[np.ndarray, np.ndarray] | None = None
 		self._peak_hold_visible = True
+		self._harmonics_visible = True
 		self._waterfall_visible = False
 		self.waterfall = WaterfallHistory(0)
 		self.waterfall_images: list[pg.ImageItem] = []
@@ -736,6 +1057,10 @@ class SpectrumPanel(QScrollArea):
 		self.plots.clear()
 		self.curves.clear()
 		self.peak_curves.clear()
+		self.harmonic_markers.clear()
+		self._selected_fundamentals.clear()
+		self._harmonic_analyzer = None
+		self._spectrum_data = None
 		self.waterfall_images.clear()
 		self.waterfall_color_bars.clear()
 		self.waterfall = WaterfallHistory(count, self.waterfall.seconds)
@@ -782,6 +1107,22 @@ class SpectrumPanel(QScrollArea):
 				trace.setDownsampling(auto=True, method="peak")
 				trace.setClipToView(True)
 			peak_curve.setVisible(self._peak_hold_visible)
+			markers = {}
+			for name, color, symbol, size in (
+				("H1", "#18804a", "t", 12),
+				("Odd H3+", "#2864b4", "o", 11),
+				("Even H2+", "#c85616", "s", 6),
+			):
+				marker = pg.ScatterPlotItem(
+					pen=pg.mkPen(color, width=2), brush=pg.mkBrush(None if name == "Odd H3+" else color),
+					symbol=symbol, size=size, hoverable=True,
+					tip=lambda **values: str(values["data"]),
+				)
+				marker.setZValue(3 + len(markers))
+				plot.addItem(marker)
+				marker.hide()
+				markers[name] = marker
+			self.harmonic_markers.append(markers)
 			image = pg.ImageItem(axisOrder="row-major")
 			plot.addItem(image)
 			color_bar = pg.ColorBarItem(
@@ -805,6 +1146,8 @@ class SpectrumPanel(QScrollArea):
 			plot.getViewBox().setRange(yRange=limits, padding=0)
 			self.curves[channel].setVisible(not visible)
 			self.peak_curves[channel].setVisible(not visible and self._peak_hold_visible)
+			for marker in self.harmonic_markers[channel].values():
+				marker.setVisible(not visible and self._harmonics_visible and bool(len(marker.points())))
 			plot_item = plot.plotItem
 			legend = plot_item.legend if plot_item is not None else None
 			if legend is not None:
@@ -956,9 +1299,363 @@ class SpectrumPanel(QScrollArea):
 		self._reflow()
 
 	def update_spectra(self, frequencies: np.ndarray, levels: np.ndarray, peaks: np.ndarray) -> None:
+		self._spectrum_data = (frequencies, levels.copy())
+		if self._harmonic_analyzer is None or self._harmonic_analyzer.frequencies is not frequencies:
+			self._harmonic_analyzer = HarmonicAnalyzer(frequencies)
 		for channel, curve in enumerate(self.curves):
 			curve.setData(frequencies, levels[:, channel])
 			self.peak_curves[channel].setData(frequencies, peaks[:, channel])
+		self._update_harmonics()
+
+	def fundamental_candidates(self) -> tuple[tuple[int, FundamentalCandidate], ...]:
+		if self._spectrum_data is None or self._harmonic_analyzer is None:
+			return ()
+		return tuple(
+			(channel, candidate)
+			for channel in range(len(self.plots))
+			for candidate in self._harmonic_analyzer.find_candidates(self._spectrum_data[1][:, channel])
+		)
+
+	def set_fundamentals(self, selected: dict[int, tuple[float, ...]]) -> None:
+		self._selected_fundamentals = selected
+		for channel, markers in enumerate(self.harmonic_markers):
+			plot_item = self.plots[channel].plotItem
+			legend = plot_item.legend if plot_item is not None else None
+			if legend is not None:
+				for name, marker in markers.items():
+					legend.removeItem(marker)
+					if selected.get(channel) and self._harmonics_visible:
+						legend.addItem(marker, name)
+				legend.setColumnCount(2 if selected.get(channel) and self._harmonics_visible else 1)
+		self._update_harmonics()
+
+	def set_harmonics_visible(self, visible: bool) -> None:
+		self._harmonics_visible = visible
+		self.set_fundamentals(self._selected_fundamentals)
+
+	def _update_harmonics(self) -> None:
+		if self._spectrum_data is None or self._harmonic_analyzer is None:
+			return
+		for channel, markers in enumerate(self.harmonic_markers):
+			fundamentals = self._selected_fundamentals.get(channel, ())
+			if not fundamentals or not self._harmonics_visible:
+				for marker in markers.values():
+					if len(marker.points()):
+						marker.clear()
+					marker.hide()
+				continue
+			spots: dict[str, list[dict]] = {name: [] for name in markers}
+			matches = self._harmonic_analyzer.match_selected(fundamentals, self._spectrum_data[1][:, channel])
+			for fundamental, harmonics in matches.items():
+				for peak in harmonics:
+					name = "H1" if peak.order == 1 else "Odd H3+" if peak.order % 2 else "Even H2+"
+					spots[name].append({
+						"pos": (peak.frequency, peak.level),
+						"data": f"Base {fundamental:.2f} Hz | H{peak.order}\n{peak.frequency:.2f} Hz | {peak.level:.1f} dBFS",
+					})
+			for name, marker in markers.items():
+				marker.setData(spots[name])
+				marker.setVisible(bool(spots[name]) and not self._waterfall_visible)
+
+
+class HarmonicAnalysisPage(QWidget):
+	def __init__(self) -> None:
+		super().__init__()
+		self._running = False
+		self._latest: tuple[np.ndarray, np.ndarray] | None = None
+		self._display: tuple[np.ndarray, np.ndarray] | None = None
+		self._analyzer: HarmonicAnalyzer | None = None
+		self._active_index: int | None = None
+		self._active_frequency = 0.0
+		self._plot_frequency = 0.0
+		self._harmonics: tuple[HarmonicPeak, ...] = ()
+		self._cursor: pg.InfiniteLine | None = None
+		layout = QVBoxLayout(self)
+		layout.setContentsMargins(12, 4, 12, 8)
+		controls = QGridLayout()
+		controls.addWidget(QLabel("Channel"), 0, 0)
+		self.channel_combo = QComboBox()
+		self.channel_combo.setAccessibleName("Harmonic analysis channel")
+		self.channel_combo.currentIndexChanged.connect(self._channel_changed)
+		controls.addWidget(self.channel_combo, 0, 1, 1, 2)
+		self.freeze_button = QToolButton()
+		self.freeze_button.setCheckable(True)
+		self.freeze_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+		self.freeze_button.setAccessibleName("Freeze harmonic analysis")
+		self.freeze_button.setToolTip("Freeze the analysis spectrum, candidate identification and order readings; capture continues.")
+		self.freeze_button.setEnabled(False)
+		self.freeze_button.toggled.connect(self._freeze_toggled)
+		controls.addWidget(self.freeze_button, 0, 3)
+		controls.addWidget(QLabel("Base"), 1, 0)
+		self.base_frequency = QDoubleSpinBox()
+		self.base_frequency.setRange(0, 24000)
+		self.base_frequency.setDecimals(2)
+		self.base_frequency.setSuffix(" Hz")
+		self.base_frequency.setSpecialValueText("None")
+		self.base_frequency.setAccessibleName("Analysis base frequency")
+		self.base_frequency.setToolTip("Inspect or edit the reference base frequency. Manual edits lock the base.")
+		self.base_frequency.editingFinished.connect(self._manual_frequency_changed)
+		controls.addWidget(self.base_frequency, 1, 1)
+		self.lock_checkbox = QCheckBox("Lock base")
+		self.lock_checkbox.setToolTip("Keep the reference frequency fixed while identified candidates drift.")
+		self.lock_checkbox.toggled.connect(self._lock_changed)
+		controls.addWidget(self.lock_checkbox, 1, 2, 1, 2)
+		controls.setColumnStretch(1, 1)
+		layout.addLayout(controls)
+		self.body_scroll = QScrollArea()
+		self.body_scroll.setWidgetResizable(True)
+		self.body_scroll.setFrameShape(QFrame.Shape.NoFrame)
+		self.body_content = QWidget()
+		self.body_layout = QVBoxLayout(self.body_content)
+		self.body_layout.setContentsMargins(0, 0, 0, 0)
+		self.body_layout.setSpacing(8)
+		self.analysis_splitter = QSplitter(Qt.Orientation.Vertical)
+		self.analysis_splitter.setAccessibleName("Resize harmonic plot and tables")
+		self.analysis_splitter.setChildrenCollapsible(False)
+		self.analysis_splitter.setOpaqueResize(True)
+		self.analysis_splitter.setHandleWidth(7)
+		self.spectrum = SpectrumPanel()
+		self.spectrum.set_peak_hold_visible(False)
+		self.spectrum.setMinimumHeight(210)
+		self.analysis_splitter.addWidget(self.spectrum)
+		self.tables_splitter = QSplitter(Qt.Orientation.Horizontal)
+		self.tables_splitter.setChildrenCollapsible(False)
+		self.candidates = HarmonicCandidatesPanel(self.tables_splitter)
+		self.candidates.setMinimumHeight(190)
+		self.candidates.candidate_activated.connect(self.focus_candidate)
+		self.candidates.selection_changed.connect(self._candidate_selection_changed)
+		details_widget = QWidget()
+		details_widget.setMinimumHeight(170)
+		details_layout = QVBoxLayout(details_widget)
+		details_layout.setContentsMargins(4, 0, 0, 0)
+		heading = QHBoxLayout()
+		heading.addWidget(QLabel("Orders"))
+		self.analysis_status = QLabel("No spectrum")
+		self.analysis_status.setWordWrap(True)
+		heading.addWidget(self.analysis_status, 1)
+		details_layout.addLayout(heading)
+		self.details = QTableWidget(0, 5)
+		self.details.setAccessibleName("Harmonic orders")
+		self.details.setHorizontalHeaderLabels(["Order", "Hz", "dBFS", "dB/H1", "Offset (Hz)"])
+		self.details.verticalHeader().hide()
+		self.details.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+		self.details.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+		self.details.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+		self.details.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+		self.details.setWordWrap(False)
+		self.details.cellClicked.connect(self._order_clicked)
+		details_layout.addWidget(self.details)
+		self.tables_splitter.addWidget(self.candidates)
+		self.tables_splitter.addWidget(details_widget)
+		self.tables_splitter.setSizes([520, 440])
+		self.analysis_splitter.addWidget(self.tables_splitter)
+		self.analysis_splitter.setStretchFactor(0, 3)
+		self.analysis_splitter.setStretchFactor(1, 2)
+		self.analysis_splitter.setSizes([300, 200])
+		self.body_layout.addWidget(self.analysis_splitter, 1)
+		self.body_scroll.setWidget(self.body_content)
+		layout.addWidget(self.body_scroll, 1)
+
+	def set_channels(self, count: int, sample_rate: float) -> None:
+		self._latest = None
+		self._display = None
+		self._analyzer = None
+		self._active_index = None
+		self._active_frequency = 0.0
+		self._plot_frequency = 0.0
+		self._harmonics = ()
+		with QSignalBlocker(self.channel_combo), QSignalBlocker(self.base_frequency), QSignalBlocker(self.freeze_button), QSignalBlocker(self.lock_checkbox):
+			self.channel_combo.clear()
+			for channel in range(count):
+				self.channel_combo.addItem(f"Channel {channel + 1:02d}", channel)
+			self.base_frequency.setMaximum(sample_rate / 2)
+			self.base_frequency.setValue(0)
+			self.freeze_button.setChecked(False)
+			self.lock_checkbox.setChecked(False)
+		self.channel_combo.setEnabled(count > 0)
+		self.base_frequency.setEnabled(count > 0)
+		self.lock_checkbox.setEnabled(count > 0)
+		self.freeze_button.setEnabled(False)
+		self.details.setRowCount(0)
+		self.analysis_status.setText("No spectrum")
+		self.candidates.set_candidates(())
+		self.candidates.set_spectrum_available(False)
+		self.candidates.status_label.setText("No spectrum")
+		self.spectrum.set_channels(1 if count else 0, sample_rate)
+		self._cursor = None
+		if count:
+			plot = self.spectrum.plots[0]
+			plot.setMinimumHeight(160)
+			self._cursor = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#65716a", width=1))
+			plot.addItem(self._cursor)
+			self._cursor.hide()
+			scene = plot.scene()
+			if isinstance(scene, pg.GraphicsScene):
+				scene.sigMouseClicked.connect(self._plot_clicked)
+
+	def set_running(self, running: bool) -> None:
+		self._running = running
+		self.candidates.set_running(running and not self.freeze_button.isChecked())
+		self._refresh_analysis()
+
+	def update_spectrum(self, frequencies: np.ndarray, levels: np.ndarray) -> None:
+		self._latest = (frequencies, levels.copy())
+		self.freeze_button.setEnabled(True)
+		if not self.freeze_button.isChecked():
+			self._display = self._latest
+			if self._analyzer is None or self._analyzer.frequencies is not frequencies:
+				self._analyzer = HarmonicAnalyzer(frequencies)
+			if not self.candidates.identify_button.isEnabled():
+				self.candidates.status_label.setText("Ready")
+			self.candidates.set_spectrum_available(True)
+			self._refresh_analysis()
+
+	def fundamental_candidates(self) -> tuple[tuple[int, FundamentalCandidate], ...]:
+		if self._display is None or self._analyzer is None:
+			return ()
+		return tuple(
+			(channel, candidate)
+			for channel in range(self._display[1].shape[1])
+			for candidate in self._analyzer.find_candidates(self._display[1][:, channel])
+		)
+
+	def focus_candidate(self, index: int) -> None:
+		if not 0 <= index < len(self.candidates.candidates):
+			return
+		self._active_index = index
+		channel, candidate = self.candidates.candidates[index]
+		with QSignalBlocker(self.channel_combo):
+			self.channel_combo.setCurrentIndex(self.channel_combo.findData(channel))
+		self._active_frequency = candidate.frequency
+		with QSignalBlocker(self.base_frequency):
+			self.base_frequency.setValue(candidate.frequency)
+		self._refresh_analysis()
+		self._fit_group()
+
+	def _fit_group(self) -> None:
+		if self._active_frequency > 0 and self.spectrum.plots:
+			maximum = min(self.spectrum._nyquist, self._active_frequency * 8)
+			self.spectrum.plots[0].getViewBox().setRange(xRange=(0, maximum), padding=0)
+
+	def _candidate_selection_changed(self, selected: dict[int, tuple[float, ...]]) -> None:
+		if self._active_index is not None and self._active_index < len(self.candidates.candidates):
+			if not self.lock_checkbox.isChecked():
+				channel, candidate = self.candidates.candidates[self._active_index]
+				with QSignalBlocker(self.channel_combo), QSignalBlocker(self.base_frequency):
+					self.channel_combo.setCurrentIndex(self.channel_combo.findData(channel))
+					self.base_frequency.setValue(candidate.frequency)
+				self._active_frequency = candidate.frequency
+		elif selected and not self.lock_checkbox.isChecked():
+			for index, (channel, candidate) in enumerate(self.candidates.candidates):
+				if candidate.frequency in selected.get(channel, ()):
+					self.focus_candidate(index)
+					return
+		elif not self.candidates.candidates:
+			self._active_index = None
+			self._active_frequency = 0.0
+			with QSignalBlocker(self.base_frequency), QSignalBlocker(self.lock_checkbox):
+				self.base_frequency.setValue(0)
+				self.lock_checkbox.setChecked(False)
+		self._refresh_analysis()
+
+	def _channel_changed(self, _index: int) -> None:
+		self._active_index = None
+		if not self.lock_checkbox.isChecked():
+			self._active_frequency = 0.0
+			with QSignalBlocker(self.base_frequency):
+				self.base_frequency.setValue(0)
+		self._refresh_analysis()
+
+	def _manual_frequency_changed(self) -> None:
+		if self.base_frequency.value() == round(self._active_frequency, 2):
+			return
+		self._active_index = None
+		self._active_frequency = self.base_frequency.value()
+		with QSignalBlocker(self.lock_checkbox):
+			self.lock_checkbox.setChecked(self._active_frequency > 0)
+		self._refresh_analysis()
+		self._fit_group()
+
+	def _lock_changed(self, locked: bool) -> None:
+		if not locked:
+			self._candidate_selection_changed(self.candidates.selected_fundamentals())
+
+	def _freeze_toggled(self, frozen: bool) -> None:
+		self.candidates.set_running(self._running and not frozen)
+		if not frozen and self._latest is not None:
+			self.update_spectrum(*self._latest)
+		else:
+			self._refresh_analysis()
+
+	def _refresh_analysis(self) -> None:
+		if not self.isVisible() or self._display is None or self._analyzer is None:
+			return
+		channel = self.channel_combo.currentData()
+		if not isinstance(channel, int) or channel >= self._display[1].shape[1]:
+			return
+		frequencies, levels = self._display
+		self.spectrum.update_spectra(frequencies, levels[:, channel:channel + 1], levels[:, channel:channel + 1])
+		plot = self.spectrum.plots[0]
+		plot.setTitle(f"Channel {channel + 1:02d}", color=CHANNEL_COLORS[channel % len(CHANNEL_COLORS)], size="11pt")
+		self.spectrum.curves[0].setPen(pg.mkPen(CHANNEL_COLORS[channel % len(CHANNEL_COLORS)], width=0))
+		if self._plot_frequency != self._active_frequency:
+			self.spectrum.set_fundamentals({0: (self._active_frequency,)} if self._active_frequency else {})
+			self._plot_frequency = self._active_frequency
+		self._harmonics = self._analyzer.match(self._active_frequency, levels[:, channel])
+		fundamental = next((peak.level for peak in self._harmonics if peak.order == 1), None)
+		self.details.setRowCount(len(self._harmonics))
+		for row, peak in enumerate(self._harmonics):
+			values = (
+				f"H{peak.order}", f"{peak.frequency:.2f}", f"{peak.level:.1f}",
+				f"{peak.level - fundamental:.1f}" if fundamental is not None else "-",
+				f"{peak.frequency - peak.order * self._active_frequency:+.2f}",
+			)
+			for column, value in enumerate(values):
+				self.details.setItem(row, column, QTableWidgetItem(value))
+		if not self._harmonics and self._cursor is not None:
+			self._cursor.hide()
+		state = "Frozen" if self.freeze_button.isChecked() else "Live" if self._running else "Stopped"
+		evidence = "H1 observed" if fundamental is not None else "H1 absent" if self._harmonics else "No matching peaks"
+		self.analysis_status.setText(f"{state} | {evidence}")
+
+	def _order_clicked(self, row: int, _column: int) -> None:
+		if 0 <= row < len(self._harmonics) and self._cursor is not None:
+			self._cursor.setValue(self._harmonics[row].frequency)
+			self._cursor.show()
+
+	def _plot_clicked(self, event) -> None:
+		if event.button() != Qt.MouseButton.LeftButton or not self._harmonics or not self.spectrum.plots:
+			return
+		view = self.spectrum.plots[0].getViewBox()
+		if not view.sceneBoundingRect().contains(event.scenePos()):
+			return
+		frequency = view.mapSceneToView(event.scenePos()).x()
+		row = min(range(len(self._harmonics)), key=lambda row: abs(self._harmonics[row].frequency - frequency))
+		self.details.setCurrentCell(row, 0)
+		self._order_clicked(row, 0)
+
+	def showEvent(self, event: QShowEvent) -> None:
+		super().showEvent(event)
+		self._refresh_analysis()
+
+	def resizeEvent(self, event: QResizeEvent) -> None:
+		super().resizeEvent(event)
+		orientation = Qt.Orientation.Vertical if self.width() < 850 else Qt.Orientation.Horizontal
+		if self.tables_splitter.orientation() != orientation:
+			self.tables_splitter.setOrientation(orientation)
+			self.tables_splitter.setSizes([230, 210])
+		table_minimums = []
+		for index in range(self.tables_splitter.count()):
+			widget = self.tables_splitter.widget(index)
+			if widget is not None:
+				table_minimums.append(max(widget.minimumHeight(), widget.minimumSizeHint().height()))
+		if orientation == Qt.Orientation.Vertical:
+			tables_height = sum(table_minimums) + self.tables_splitter.handleWidth() * max(0, len(table_minimums) - 1)
+		else:
+			tables_height = max(table_minimums, default=0)
+		minimum_height = self.spectrum.minimumHeight() + self.analysis_splitter.handleWidth() + tables_height
+		self.analysis_splitter.setMinimumHeight(minimum_height)
+		self.body_content.setMinimumHeight(minimum_height)
 
 
 class MainWindow(QMainWindow):
@@ -1118,12 +1815,27 @@ class MainWindow(QMainWindow):
 		self.view_tabs.setExpanding(False)
 		self.view_tabs.addTab("Spectrum")
 		self.view_tabs.addTab("Waterfall")
+		self.view_tabs.addTab("Harmonics")
 		chart_heading.addWidget(self.view_tabs)
 		chart_heading.addStretch()
 		self.peak_hold_checkbox = QCheckBox("Peak hold")
 		self.peak_hold_checkbox.setChecked(True)
 		self.peak_hold_checkbox.setToolTip("Show the highest level at each frequency since measurement start or the last peak reset.")
 		chart_heading.addWidget(self.peak_hold_checkbox)
+		self.harmonics_button = QToolButton()
+		self.harmonics_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
+		self.harmonics_button.setToolTip("Identify and select fundamental candidates")
+		self.harmonics_button.setAccessibleName("Fundamental candidates")
+		self.harmonics_button.setEnabled(False)
+		self.harmonics_button.clicked.connect(self._open_harmonics)
+		chart_heading.addWidget(self.harmonics_button)
+		self.harmonic_overlay_button = QToolButton()
+		self.harmonic_overlay_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView))
+		self.harmonic_overlay_button.setCheckable(True)
+		self.harmonic_overlay_button.setChecked(True)
+		self.harmonic_overlay_button.setToolTip("Show harmonic markers in Spectrum")
+		self.harmonic_overlay_button.setAccessibleName("Show harmonic markers")
+		chart_heading.addWidget(self.harmonic_overlay_button)
 		self.history_label = QLabel("History")
 		self.history_seconds = QSpinBox()
 		self.history_seconds.setRange(5, 120)
@@ -1161,13 +1873,21 @@ class MainWindow(QMainWindow):
 		frequency_heading.addWidget(self.reset_zoom_button)
 		right_layout.addLayout(frequency_heading)
 		self.spectra = SpectrumPanel()
-		self.reset_zoom_button.clicked.connect(self.spectra.reset_zoom)
+		self.harmonics_page = HarmonicAnalysisPage()
+		self.harmonic_dialog = self.harmonics_page.candidates
+		self.harmonic_dialog.identify_requested.connect(self._identify_fundamentals)
+		self.harmonic_dialog.selection_changed.connect(self.spectra.set_fundamentals)
+		self.harmonic_overlay_button.toggled.connect(self.spectra.set_harmonics_visible)
+		self.reset_zoom_button.clicked.connect(self._reset_zoom)
 		self.view_tabs.currentChanged.connect(self._spectrum_view_changed)
 		self.history_seconds.valueChanged.connect(self._history_seconds_changed)
 		self.peak_hold_checkbox.toggled.connect(self.spectra.set_peak_hold_visible)
 		self.frequency_minimum.valueChanged.connect(self._frequency_minimum_changed)
 		self.frequency_maximum.valueChanged.connect(self._frequency_maximum_changed)
-		right_layout.addWidget(self.spectra)
+		self.view_stack = QStackedWidget()
+		self.view_stack.addWidget(self.spectra)
+		self.view_stack.addWidget(self.harmonics_page)
+		right_layout.addWidget(self.view_stack)
 		self.splitter.addWidget(left)
 		self.splitter.addWidget(right)
 		self.splitter.setStretchFactor(0, 0)
@@ -1187,6 +1907,7 @@ class MainWindow(QMainWindow):
 
 	def _set_running(self, running: bool) -> None:
 		self.icon_animator.set_running(running)
+		self.harmonics_page.set_running(running)
 		self.start_button.setText("Stop" if running else "Start")
 		icon = QStyle.StandardPixmap.SP_MediaStop if running else QStyle.StandardPixmap.SP_MediaPlay
 		self.start_button.setIcon(self.style().standardIcon(icon))
@@ -1235,12 +1956,36 @@ class MainWindow(QMainWindow):
 			message = f"Recording saved: {recorder.path}"
 		self.record_checkbox.setToolTip(message)
 
+	def _open_harmonics(self) -> None:
+		if not self.harmonic_dialog.candidates:
+			self._identify_fundamentals()
+		self.view_tabs.setCurrentIndex(2)
+		self.harmonic_dialog.show()
+
+	def _identify_fundamentals(self) -> None:
+		spacing = float(self.analyzer.frequencies[1]) if self.analyzer is not None else 1.0
+		candidates = self.harmonics_page.fundamental_candidates() if self.harmonics_page.freeze_button.isChecked() else self.spectra.fundamental_candidates()
+		self.harmonic_dialog.merge_candidates(candidates, spacing)
+
+	def _active_spectrum(self) -> SpectrumPanel:
+		return self.harmonics_page.spectrum if self.view_tabs.currentIndex() == 2 else self.spectra
+
+	def _reset_zoom(self) -> None:
+		self._active_spectrum().reset_zoom()
+
 	def _spectrum_view_changed(self, index: int) -> None:
 		waterfall = index == 1
-		self.peak_hold_checkbox.setVisible(not waterfall)
+		self.view_stack.setCurrentIndex(1 if index == 2 else 0)
+		self.peak_hold_checkbox.setVisible(index == 0)
+		self.harmonics_button.setVisible(index != 2)
+		self.harmonic_overlay_button.setVisible(index == 0)
 		self.history_label.setVisible(waterfall)
 		self.history_seconds.setVisible(waterfall)
 		self.spectra.set_waterfall_visible(waterfall)
+		minimum, maximum = self._active_spectrum().frequency_range
+		with QSignalBlocker(self.frequency_minimum), QSignalBlocker(self.frequency_maximum):
+			self.frequency_minimum.setValue(minimum)
+			self.frequency_maximum.setValue(maximum)
 
 	def _history_seconds_changed(self, seconds: int) -> None:
 		self.spectra.set_history_seconds(seconds)
@@ -1248,12 +1993,12 @@ class MainWindow(QMainWindow):
 	def _frequency_minimum_changed(self, minimum: int) -> None:
 		if minimum >= self.frequency_maximum.value():
 			self.frequency_maximum.setValue(minimum + 1)
-		self.spectra.set_frequency_range(minimum, self.frequency_maximum.value())
+		self._active_spectrum().set_frequency_range(minimum, self.frequency_maximum.value())
 
 	def _frequency_maximum_changed(self, maximum: int) -> None:
 		if maximum <= self.frequency_minimum.value():
 			self.frequency_minimum.setValue(maximum - 1)
-		self.spectra.set_frequency_range(self.frequency_minimum.value(), maximum)
+		self._active_spectrum().set_frequency_range(self.frequency_minimum.value(), maximum)
 
 	def _reset_fps(self) -> None:
 		self._fps_frames = 0
@@ -1285,6 +2030,9 @@ class MainWindow(QMainWindow):
 		self.spectra.set_channel_enabled(channel, enabled)
 
 	def _show_channels(self, count: int, sample_rate: float) -> None:
+		self.harmonics_page.set_channels(count, sample_rate)
+		self.harmonics_button.setEnabled(False)
+		self.harmonic_overlay_button.setEnabled(count > 0)
 		nyquist = int(sample_rate / 2)
 		self.frequency_maximum.setMaximum(nyquist)
 		self.frequency_minimum.setMaximum(max(0, nyquist - 1))
@@ -1445,6 +2193,8 @@ class MainWindow(QMainWindow):
 			widget.update_levels(float(frame.levels[channel]), float(frame.peaks[channel]))
 		if frame.spectrum is not None and frame.spectrum_peaks is not None:
 			self.spectra.update_spectra(self.analyzer.frequencies, frame.spectrum, frame.spectrum_peaks)
+			self.harmonics_page.update_spectrum(self.analyzer.frequencies, frame.spectrum)
+			self.harmonics_button.setEnabled(True)
 			self.spectra.update_waterfall(self.analyzer.frequencies, frame.spectrum_history, settings.block_size, settings.sample_rate)
 		seconds = int(frame.frames / settings.sample_rate)
 		hours, remainder = divmod(seconds, 3600)

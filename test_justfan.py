@@ -259,6 +259,64 @@ class SignalTests(unittest.TestCase):
             justfan.SpectrumAnalyzer(self.sample_rate, self.size).analyze(np.zeros((128, 2)))
 
 
+class HarmonicAnalysisTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.sample_rate = 48000
+        self.size = 32768
+        self.spectrum = justfan.SpectrumAnalyzer(self.sample_rate, self.size)
+        self.analyzer = justfan.HarmonicAnalyzer(self.spectrum.frequencies)
+
+    def levels(self, tones: tuple[tuple[float, float], ...]) -> np.ndarray:
+        time = np.arange(self.size) / self.sample_rate
+        samples = sum(amplitude * np.sin(2 * np.pi * frequency * time) for frequency, amplitude in tones)
+        return self.spectrum.analyze(np.asarray(samples)[:, None])[:, 0]
+
+    def test_strong_second_harmonic_and_unrelated_tone_remain_distinct(self) -> None:
+        levels = self.levels(((100.3, 0.04), (200.6, 0.4), (300.9, 0.18), (401.2, 0.08), (730.4, 0.12)))
+        candidates = self.analyzer.find_candidates(levels)
+        self.assertAlmostEqual(candidates[0].frequency, 100.3, delta=0.5)
+        self.assertEqual([peak.order for peak in candidates[0].harmonics], [1, 2, 3, 4])
+        self.assertTrue(any(abs(candidate.frequency - 730.4) < 0.5 for candidate in candidates))
+        self.assertFalse(any(abs(candidate.frequency - 200.6) < 0.5 for candidate in candidates))
+
+    def test_missing_fundamental_is_inferred_from_coprime_harmonics(self) -> None:
+        levels = self.levels(((246.8, 0.4), (370.2, 0.25), (493.6, 0.18)))
+        candidates = self.analyzer.find_candidates(levels)
+        self.assertAlmostEqual(candidates[0].frequency, 123.4, delta=0.5)
+        self.assertTrue(candidates[0].inferred)
+        self.assertEqual([peak.order for peak in candidates[0].harmonics], [2, 3, 4])
+        self.assertFalse(any(abs(candidate.frequency - 61.7) < 0.5 for candidate in candidates))
+
+    def test_even_harmonics_alone_do_not_invent_an_unobservable_subharmonic(self) -> None:
+        candidates = self.analyzer.find_candidates(self.levels(((200.6, 0.4), (401.2, 0.2))))
+        self.assertAlmostEqual(candidates[0].frequency, 200.6, delta=0.5)
+        self.assertFalse(candidates[0].inferred)
+        self.assertFalse(any(abs(candidate.frequency - 100.3) < 0.5 for candidate in candidates))
+
+    def test_matching_labels_only_observed_harmonics(self) -> None:
+        levels = self.levels(((100.3, 0.1), (200.6, 0.3), (401.2, 0.08), (730.4, 0.12)))
+        peaks = self.analyzer.match(100.3, levels)
+        self.assertEqual([peak.order for peak in peaks], [1, 2, 4])
+        for peak in peaks:
+            self.assertAlmostEqual(peak.frequency, peak.order * 100.3, delta=0.5)
+
+    def test_inferred_common_subharmonic_retains_observed_alternatives(self) -> None:
+        levels = self.levels(((200.6, 0.24), (401.2, 0.12), (601.8, 0.08), (300.9, 0.2), (902.7, 0.1)))
+        candidates = self.analyzer.find_candidates(levels)
+        for frequency in (100.3, 200.6, 300.9):
+            self.assertTrue(any(abs(candidate.frequency - frequency) < 0.5 for candidate in candidates))
+        matches = self.analyzer.match_selected((200.6, 300.9), levels)
+        self.assertAlmostEqual(matches[200.6][2].frequency, 601.8, delta=0.5)
+        self.assertAlmostEqual(matches[300.9][1].frequency, 601.8, delta=0.5)
+        self.assertEqual(matches[200.6][2].order, 3)
+        self.assertEqual(matches[300.9][1].order, 2)
+
+    def test_silence_and_broadband_noise_produce_no_candidates(self) -> None:
+        self.assertEqual(self.analyzer.find_candidates(np.full(self.size // 2 + 1, justfan.DB_FLOOR)), ())
+        samples = np.random.default_rng(42).normal(0, 0.01, (self.size, 1))
+        self.assertEqual(self.analyzer.find_candidates(self.spectrum.analyze(samples)[:, 0]), ())
+
+
 class RecordingPathTests(unittest.TestCase):
     def setUp(self) -> None:
         directory = tempfile.TemporaryDirectory()
@@ -1376,6 +1434,646 @@ class InterfaceTests(unittest.TestCase):
         self.window.refresh_devices()
         self.assertFalse(self.window.reset_zoom_button.isEnabled())
         self.window.spectra.reset_zoom()
+
+    def harmonic_frame(self) -> np.ndarray:
+        self.window.fft_size.setCurrentIndex(self.window.fft_size.findData(32768))
+        self.window.start_capture()
+        settings = self.window.capture.settings
+        stream = self.window.capture.stream
+        assert settings is not None and isinstance(stream, FakeStream)
+        time = np.arange(settings.block_size) / settings.sample_rate
+        tones = ((100.3, 0.04), (200.6, 0.4), (300.9, 0.18), (401.2, 0.08), (730.4, 0.12))
+        first = sum(amplitude * np.sin(2 * np.pi * frequency * time) for frequency, amplitude in tones)
+        second = 0.1 * np.sin(2 * np.pi * 175.7 * time) + 0.05 * np.sin(2 * np.pi * 351.4 * time)
+        samples = np.column_stack((first, second))
+        stream.callback(samples, settings.block_size, None, "")
+        self.window._update_measurement()
+        return samples
+
+    def test_harmonic_candidates_require_opt_in_and_support_multiple_groups(self) -> None:
+        self.assertFalse(self.window.harmonics_button.isEnabled())
+        self.harmonic_frame()
+        stream = self.window.capture.stream
+        self.assertTrue(self.window.harmonics_button.isEnabled())
+        self.window.harmonics_button.click()
+        dialog = self.window.harmonic_dialog
+        self.assertTrue(dialog.isVisible())
+        self.assertFalse(dialog.isModal())
+        self.assertEqual(dialog.selected_fundamentals(), {})
+        self.assertGreaterEqual(len(dialog.candidates), 3)
+        for row, (channel, candidate) in enumerate(dialog.candidates):
+            if channel == 0 and any(abs(candidate.frequency - frequency) < 0.5 for frequency in (100.3, 730.4)):
+                item = dialog.table.item(row, 0)
+                assert item is not None
+                item.setCheckState(Qt.CheckState.Checked)
+        self.assertEqual(len(dialog.selected_fundamentals()[0]), 2)
+        markers = self.window.spectra.harmonic_markers
+        plot_item = self.window.spectra.plots[0].plotItem
+        assert plot_item is not None and plot_item.legend is not None
+        self.assertEqual(plot_item.legend.columnCount, 2)
+        self.assertEqual({name: len(marker.points()) for name, marker in markers[0].items()}, {"H1": 2, "Odd H3+": 1, "Even H2+": 2})
+        self.assertTrue(all(not marker.isVisible() for marker in markers[1].values()))
+        self.assertIn("H3", markers[0]["Odd H3+"].points()[0].data())
+        marker = markers[0]["Odd H3+"]
+        point = marker.points()[0]
+        self.assertIn("H3", marker.opts["tip"](x=point.pos().x(), y=point.pos().y(), data=point.data()))
+        self.assertEqual(len({marker.opts["pen"].color().name() for marker in markers[0].values()}), 3)
+        for row in range(dialog.table.rowCount()):
+            item = dialog.table.item(row, 0)
+            assert item is not None
+            item.setCheckState(Qt.CheckState.Unchecked)
+        self.assertTrue(all(not marker.isVisible() for channel in markers for marker in channel.values()))
+        self.assertEqual(plot_item.legend.columnCount, 1)
+        self.assertIs(self.window.capture.stream, stream)
+
+    def test_harmonic_rescan_retains_observed_candidates_and_selections(self) -> None:
+        samples = self.harmonic_frame()
+        self.window._open_harmonics()
+        dialog = self.window.harmonic_dialog
+        row = next(row for row, (channel, candidate) in enumerate(dialog.candidates) if channel == 0 and abs(candidate.frequency - 100.3) < 0.5)
+        item = dialog.table.item(row, 0)
+        assert item is not None
+        item.setCheckState(Qt.CheckState.Checked)
+        selected = dialog.selected_fundamentals()
+        dialog.identify_button.click()
+        self.assertEqual(dialog.selected_fundamentals(), selected)
+        frequencies = [(channel, candidate.frequency) for channel, candidate in dialog.candidates]
+        samples[:, 0] = 0
+        stream = self.window.capture.stream
+        assert isinstance(stream, FakeStream)
+        stream.callback(samples, len(samples), None, "")
+        self.window._update_measurement()
+        self.assertEqual(dialog.selected_fundamentals(), selected)
+        self.assertTrue(all(not len(marker.points()) for marker in self.window.spectra.harmonic_markers[0].values()))
+        self.assertTrue(np.any(self.window.spectra.peak_curves[0].getData()[1] > -40))
+        dialog.identify_button.click()
+        self.assertEqual(dialog.selected_fundamentals(), selected)
+        self.assertEqual([(channel, candidate.frequency) for channel, candidate in dialog.candidates], frequencies)
+        for row, (channel, _candidate) in enumerate(dialog.candidates):
+            evidence = dialog.table.item(row, 3)
+            assert evidence is not None
+            self.assertEqual(evidence.text(), "Retained" if channel == 0 else "H1 observed")
+
+    def test_harmonic_selection_survives_view_stop_and_peak_reset_but_not_restart(self) -> None:
+        self.harmonic_frame()
+        self.window._open_harmonics()
+        dialog = self.window.harmonic_dialog
+        for channel in (0, 1):
+            row = next(row for row, (candidate_channel, _candidate) in enumerate(dialog.candidates) if candidate_channel == channel)
+            item = dialog.table.item(row, 0)
+            assert item is not None
+            item.setCheckState(Qt.CheckState.Checked)
+        selected = dialog.selected_fundamentals()
+        self.assertEqual(set(selected), {0, 1})
+        self.window.view_tabs.setCurrentIndex(1)
+        self.assertTrue(all(not marker.isVisible() for markers in self.window.spectra.harmonic_markers for marker in markers.values()))
+        self.assertEqual(dialog.selected_fundamentals(), selected)
+        self.window._stop_capture()
+        self.window.view_tabs.setCurrentIndex(0)
+        self.assertTrue(all(markers["H1"].isVisible() for markers in self.window.spectra.harmonic_markers))
+        self.window._reset_measurement()
+        self.assertEqual(dialog.selected_fundamentals(), selected)
+        self.window.start_capture()
+        self.assertEqual(dialog.candidates, ())
+        self.assertEqual(dialog.selected_fundamentals(), {})
+        self.assertFalse(self.window.harmonics_button.isEnabled())
+        self.assertFalse(dialog.identify_button.isEnabled())
+        self.assertTrue(all(not len(marker.points()) for markers in self.window.spectra.harmonic_markers for marker in markers.values()))
+
+    def test_harmonic_auto_identification_uses_fresh_spectra_and_retains_selection(self) -> None:
+        samples = self.harmonic_frame()
+        self.window._open_harmonics()
+        dialog = self.window.harmonic_dialog
+        self.assertFalse(dialog.auto_checkbox.isChecked())
+        self.assertFalse(dialog.auto_timer.isActive())
+        row = next(row for row, (channel, candidate) in enumerate(dialog.candidates) if channel == 0 and abs(candidate.frequency - 100.3) < 0.5)
+        item = dialog.table.item(row, 0)
+        assert item is not None
+        item.setCheckState(Qt.CheckState.Checked)
+        selected = dialog.selected_fundamentals()
+        dialog.auto_checkbox.setChecked(True)
+        self.assertTrue(dialog.auto_timer.isActive())
+        self.assertEqual(dialog.auto_timer.interval(), 1000)
+        stream = self.window.capture.stream
+        assert isinstance(stream, FakeStream)
+        with patch.object(self.window.spectra, "fundamental_candidates", wraps=self.window.spectra.fundamental_candidates) as identify:
+            dialog.auto_timer.timeout.emit()
+            identify.assert_not_called()
+            stream.callback(samples, len(samples), None, "")
+            self.window._update_measurement()
+            identify.assert_not_called()
+            dialog.auto_timer.timeout.emit()
+            identify.assert_called_once()
+            self.assertEqual(dialog.selected_fundamentals(), selected)
+            dialog.auto_timer.timeout.emit()
+            identify.assert_called_once()
+
+    def test_harmonic_auto_identification_retries_after_an_empty_scan(self) -> None:
+        samples = self.harmonic_frame()
+        stream = self.window.capture.stream
+        assert isinstance(stream, FakeStream)
+        stream.callback(np.zeros_like(samples), len(samples), None, "")
+        self.window._update_measurement()
+        self.window._open_harmonics()
+        dialog = self.window.harmonic_dialog
+        self.assertEqual(dialog.candidates, ())
+        dialog.auto_checkbox.setChecked(True)
+        stream.callback(np.zeros_like(samples), len(samples), None, "")
+        self.window._update_measurement()
+        dialog.auto_timer.timeout.emit()
+        self.assertEqual(dialog.candidates, ())
+        stream.callback(samples * 0.001, len(samples), None, "")
+        self.window._update_measurement()
+        self.assertEqual(dialog.candidates, ())
+        dialog.auto_timer.timeout.emit()
+        self.assertTrue(any(channel == 0 and abs(candidate.frequency - 100.3) < 0.5 for channel, candidate in dialog.candidates))
+        self.assertEqual(dialog.selected_fundamentals(), {})
+        dialog.auto_checkbox.setChecked(False)
+        self.assertFalse(dialog.auto_timer.isActive())
+
+    def test_harmonic_auto_identification_pauses_and_resumes_with_capture_and_visibility(self) -> None:
+        samples = self.harmonic_frame()
+        self.window._open_harmonics()
+        dialog = self.window.harmonic_dialog
+        dialog.auto_checkbox.setChecked(True)
+        stream = self.window.capture.stream
+        assert isinstance(stream, FakeStream)
+        with patch.object(self.window.spectra, "fundamental_candidates", wraps=self.window.spectra.fundamental_candidates) as identify:
+            dialog.close()
+            self.assertFalse(dialog.auto_timer.isActive())
+            stream.callback(samples, len(samples), None, "")
+            self.window._update_measurement()
+            dialog.auto_timer.timeout.emit()
+            identify.assert_not_called()
+            self.window._open_harmonics()
+            self.assertTrue(dialog.auto_timer.isActive())
+            identify.assert_called_once()
+            self.window._stop_capture()
+            self.assertFalse(dialog.auto_timer.isActive())
+            self.assertFalse(dialog.auto_checkbox.isEnabled())
+            self.assertTrue(dialog.auto_checkbox.isChecked())
+            dialog.auto_timer.timeout.emit()
+            identify.assert_called_once()
+            dialog.identify_button.click()
+            self.assertEqual(identify.call_count, 2)
+            self.window.start_capture()
+            self.assertEqual(dialog.candidates, ())
+            self.assertFalse(dialog.auto_timer.isActive())
+            stream = self.window.capture.stream
+            assert isinstance(stream, FakeStream)
+            stream.callback(samples, len(samples), None, "")
+            self.window._update_measurement()
+            self.assertEqual(identify.call_count, 3)
+            self.assertTrue(dialog.auto_timer.isActive())
+            self.assertTrue(dialog.candidates)
+
+    def test_harmonic_auto_identification_defers_while_checking_candidates(self) -> None:
+        samples = self.harmonic_frame()
+        self.window._open_harmonics()
+        dialog = self.window.harmonic_dialog
+        dialog.auto_checkbox.setChecked(True)
+        row = next(row for row, (channel, candidate) in enumerate(dialog.candidates) if channel == 0 and abs(candidate.frequency - 100.3) < 0.5)
+        item = dialog.table.item(row, 0)
+        viewport = dialog.table.viewport()
+        assert item is not None and viewport is not None
+        rect = dialog.table.visualItemRect(item)
+        position = rect.center()
+        position.setX(rect.left() + 10)
+        stream = self.window.capture.stream
+        assert isinstance(stream, FakeStream)
+        stream.callback(samples, len(samples), None, "")
+        self.window._update_measurement()
+        with patch.object(self.window.spectra, "fundamental_candidates", wraps=self.window.spectra.fundamental_candidates) as identify:
+            QTest.mousePress(viewport, Qt.MouseButton.LeftButton, pos=position)
+            try:
+                dialog.auto_timer.timeout.emit()
+                identify.assert_not_called()
+            finally:
+                QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, pos=position)
+            selected = dialog.selected_fundamentals()
+            self.assertTrue(selected)
+            dialog.auto_timer.timeout.emit()
+            identify.assert_called_once()
+            self.assertEqual(dialog.selected_fundamentals(), selected)
+
+    def test_harmonic_auto_identification_waits_for_new_device_audio(self) -> None:
+        self.harmonic_frame()
+        self.window._open_harmonics()
+        dialog = self.window.harmonic_dialog
+        dialog.auto_checkbox.setChecked(True)
+        self.window.device_combo.setCurrentIndex(self.window.device_combo.findData(self.devices[1]))
+        with patch.object(self.window.spectra, "fundamental_candidates", wraps=self.window.spectra.fundamental_candidates) as identify:
+            self.assertEqual(dialog.candidates, ())
+            self.assertFalse(dialog.auto_timer.isActive())
+            dialog.auto_timer.timeout.emit()
+            identify.assert_not_called()
+            self.window.start_capture()
+            dialog.auto_timer.timeout.emit()
+            identify.assert_not_called()
+            settings = self.window.capture.settings
+            stream = self.window.capture.stream
+            assert settings is not None and isinstance(stream, FakeStream)
+            time = np.arange(settings.block_size) / settings.sample_rate
+            samples = (0.1 * np.sin(2 * np.pi * 500 * time))[:, None]
+            stream.callback(samples, len(samples), None, "")
+            self.window._update_measurement()
+            identify.assert_called_once()
+            self.assertTrue(dialog.auto_timer.isActive())
+            self.assertTrue(dialog.candidates)
+            self.assertTrue(all(channel == 0 and abs(candidate.frequency - 500) < 2 for channel, candidate in dialog.candidates))
+
+    def test_harmonic_merge_updates_existing_rows_and_appends_new_candidates(self) -> None:
+        self.harmonic_frame()
+        self.window._open_harmonics()
+        dialog = self.window.harmonic_dialog
+        original = dialog.candidates
+        item = dialog.table.item(0, 0)
+        assert item is not None
+        item.setCheckState(Qt.CheckState.Checked)
+        updated = justfan.FundamentalCandidate(original[0][1].frequency + 0.2, original[0][1].harmonics, original[0][1].score)
+        new = justfan.FundamentalCandidate(500, (justfan.HarmonicPeak(1, 500, -30),), 1)
+        incoming = (original[2], (0, new), (0, updated))
+        dialog.merge_candidates(incoming, 48000 / 32768)
+        self.assertEqual(dialog.candidates, ((0, updated), original[1], original[2], (0, new)))
+        self.assertEqual(dialog.selected_fundamentals(), {0: (updated.frequency,)})
+        dialog.merge_candidates(tuple(reversed(incoming)), 48000 / 32768)
+        self.assertEqual(dialog.candidates, ((0, updated), original[1], original[2], (0, new)))
+        self.assertEqual(dialog.selected_fundamentals(), {0: (updated.frequency,)})
+        evidence = dialog.table.item(1, 3)
+        assert evidence is not None
+        self.assertEqual(evidence.text(), "Retained")
+        self.assertIn("latest identification", evidence.toolTip())
+
+    def test_harmonic_auto_identification_retains_entries_during_silence(self) -> None:
+        samples = self.harmonic_frame()
+        self.window._open_harmonics()
+        dialog = self.window.harmonic_dialog
+        dialog.auto_checkbox.setChecked(True)
+        item = dialog.table.item(0, 0)
+        assert item is not None
+        item.setCheckState(Qt.CheckState.Checked)
+        candidates = dialog.candidates
+        selected = dialog.selected_fundamentals()
+        stream = self.window.capture.stream
+        assert isinstance(stream, FakeStream)
+        for _scan in range(2):
+            stream.callback(np.zeros_like(samples), len(samples), None, "")
+            self.window._update_measurement()
+            dialog.auto_timer.timeout.emit()
+            self.assertEqual(dialog.candidates, candidates)
+            self.assertEqual(dialog.selected_fundamentals(), selected)
+        for row in range(dialog.table.rowCount()):
+            evidence = dialog.table.item(row, 3)
+            assert evidence is not None
+            self.assertEqual(evidence.text(), "Retained")
+        self.assertTrue(all(not marker.isVisible() for markers in self.window.spectra.harmonic_markers for marker in markers.values()))
+
+    def test_harmonic_clear_list_clears_selections_without_stopping_auto_or_capture(self) -> None:
+        self.assertFalse(self.window.harmonic_dialog.clear_button.isEnabled())
+        samples = self.harmonic_frame()
+        self.window._open_harmonics()
+        dialog = self.window.harmonic_dialog
+        assert self.application is not None
+        self.application.processEvents()
+        self.assertEqual(dialog.clear_button.text(), "Clear")
+        self.assertLess(dialog.clear_button.geometry().bottom(), dialog.table.geometry().top())
+        self.assertEqual(dialog.clear_button.geometry().center().y(), dialog.identify_button.geometry().center().y())
+        self.assertGreater(dialog.clear_button.geometry().left(), dialog.identify_button.geometry().right())
+        dialog.auto_checkbox.setChecked(True)
+        item = dialog.table.item(0, 0)
+        assert item is not None
+        item.setCheckState(Qt.CheckState.Checked)
+        stream = self.window.capture.stream
+        assert isinstance(stream, FakeStream)
+        held = self.window.spectra.peak_curves[0].getData()[1].copy()
+        stream.callback(samples, len(samples), None, "")
+        self.window._update_measurement()
+        elapsed = self.window.elapsed_label.text()
+        dialog.clear_button.click()
+        self.assertEqual(dialog.candidates, ())
+        self.assertEqual(dialog.table.rowCount(), 0)
+        self.assertEqual(dialog.selected_fundamentals(), {})
+        self.assertFalse(dialog.clear_button.isEnabled())
+        self.assertTrue(dialog.auto_checkbox.isChecked())
+        self.assertTrue(dialog.auto_timer.isActive())
+        self.assertIs(self.window.capture.stream, stream)
+        self.assertEqual(self.window.elapsed_label.text(), elapsed)
+        np.testing.assert_array_equal(self.window.spectra.peak_curves[0].getData()[1], held)
+        self.assertTrue(all(not marker.isVisible() for markers in self.window.spectra.harmonic_markers for marker in markers.values()))
+        with patch.object(self.window.spectra, "fundamental_candidates", wraps=self.window.spectra.fundamental_candidates) as identify:
+            dialog.auto_timer.timeout.emit()
+            identify.assert_not_called()
+            stream.callback(samples, len(samples), None, "")
+            self.window._update_measurement()
+            dialog.auto_timer.timeout.emit()
+            identify.assert_called_once()
+        self.assertTrue(dialog.candidates)
+        self.assertTrue(dialog.clear_button.isEnabled())
+        self.assertEqual(dialog.selected_fundamentals(), {})
+        self.window._stop_capture()
+        dialog.clear_button.click()
+        self.assertEqual(dialog.candidates, ())
+        self.assertTrue(dialog.auto_checkbox.isChecked())
+        self.assertFalse(dialog.auto_timer.isActive())
+        dialog.identify_button.click()
+        self.assertTrue(dialog.candidates)
+
+    def test_harmonic_header_sorting_starts_unsorted_and_uses_numeric_frequencies(self) -> None:
+        dialog = self.window.harmonic_dialog
+        candidates = tuple(
+            (channel, justfan.FundamentalCandidate(frequency, (justfan.HarmonicPeak(1, frequency, -30),), 1))
+            for channel, frequency in ((1, 1000.0), (0, 90.0), (0, 240.0))
+        )
+        dialog.set_candidates(candidates)
+        dialog.show()
+        assert self.application is not None
+        self.application.processEvents()
+        header = dialog.table.horizontalHeader()
+        viewport = header.viewport()
+        assert viewport is not None
+
+        def frequencies() -> list[float]:
+            items = [dialog.table.item(row, 1) for row in range(dialog.table.rowCount())]
+            return [float(item.text()) for item in items if item is not None]
+
+        def click_header(column: int) -> None:
+            position = viewport.rect().center()
+            position.setX(header.sectionViewportPosition(column) + header.sectionSize(column) // 2)
+            QTest.mouseClick(viewport, Qt.MouseButton.LeftButton, pos=position)
+
+        self.assertFalse(header.isSortIndicatorShown())
+        self.assertEqual(frequencies(), [1000, 90, 240])
+        appended = (1, justfan.FundamentalCandidate(20, (justfan.HarmonicPeak(1, 20, -40),), 0.5))
+        dialog.merge_candidates((appended,), 1)
+        self.assertEqual(frequencies(), [1000, 90, 240, 20])
+        click_header(1)
+        self.assertTrue(header.isSortIndicatorShown())
+        self.assertEqual(header.sortIndicatorOrder(), Qt.SortOrder.AscendingOrder)
+        self.assertEqual(frequencies(), [20, 90, 240, 1000])
+        click_header(1)
+        self.assertEqual(header.sortIndicatorOrder(), Qt.SortOrder.DescendingOrder)
+        self.assertEqual(frequencies(), [1000, 240, 90, 20])
+        self.assertEqual(dialog.candidates, (*candidates, appended))
+        click_header(0)
+        self.assertEqual(header.sortIndicatorOrder(), Qt.SortOrder.AscendingOrder)
+        items = [dialog.table.item(row, 0) for row in range(dialog.table.rowCount())]
+        self.assertEqual([item.text() for item in items if item is not None], ["Channel 01", "Channel 01", "Channel 02", "Channel 02"])
+
+    def test_harmonic_sorting_keeps_candidate_identity_across_selection_and_refresh(self) -> None:
+        samples = self.harmonic_frame()
+        self.window._open_harmonics()
+        dialog = self.window.harmonic_dialog
+        original = dialog.candidates
+        dialog._sort_candidates(1)
+        item = dialog.table.item(1, 0)
+        assert item is not None
+        self.assertEqual(item.text(), "Channel 02")
+        item.setCheckState(Qt.CheckState.Checked)
+        self.assertEqual(dialog.selected_fundamentals(), {1: (original[2][1].frequency,)})
+        self.assertTrue(self.window.spectra.harmonic_markers[1]["H1"].isVisible())
+        self.assertTrue(all(not marker.isVisible() for marker in self.window.spectra.harmonic_markers[0].values()))
+        dialog._sort_candidates(1)
+        self.assertEqual(dialog.selected_fundamentals(), {1: (original[2][1].frequency,)})
+        updated = justfan.FundamentalCandidate(original[2][1].frequency + 0.2, original[2][1].harmonics, original[2][1].score)
+        appended = (0, justfan.FundamentalCandidate(500, (justfan.HarmonicPeak(1, 500, -30),), 1))
+        dialog.merge_candidates(((1, updated), appended), 48000 / 32768)
+        self.assertEqual(dialog.candidates, (original[0], original[1], (1, updated), appended))
+        self.assertEqual(dialog.selected_fundamentals(), {1: (updated.frequency,)})
+        items = [dialog.table.item(row, 1) for row in range(dialog.table.rowCount())]
+        self.assertEqual([item.data(Qt.ItemDataRole.DisplayRole) for item in items if item is not None], sorted((round(candidate.frequency, 2) for _channel, candidate in dialog.candidates), reverse=True))
+        dialog.auto_checkbox.setChecked(True)
+        stream = self.window.capture.stream
+        assert isinstance(stream, FakeStream)
+        stream.callback(samples, len(samples), None, "")
+        self.window._update_measurement()
+        dialog.auto_timer.timeout.emit()
+        self.assertEqual(dialog.selected_fundamentals(), {1: (original[2][1].frequency,)})
+        header = dialog.table.horizontalHeader()
+        self.assertEqual(header.sortIndicatorSection(), 1)
+        self.assertEqual(header.sortIndicatorOrder(), Qt.SortOrder.DescendingOrder)
+        items = [dialog.table.item(row, 1) for row in range(dialog.table.rowCount())]
+        self.assertEqual([item.data(Qt.ItemDataRole.DisplayRole) for item in items if item is not None], sorted((round(candidate.frequency, 2) for _channel, candidate in dialog.candidates), reverse=True))
+        dialog.clear_button.click()
+        self.assertEqual(dialog.candidates, ())
+        self.assertEqual(dialog.selected_fundamentals(), {})
+        dialog.identify_button.click()
+        self.assertTrue(dialog.candidates)
+        self.assertEqual(dialog.selected_fundamentals(), {})
+        self.assertEqual(header.sortIndicatorOrder(), Qt.SortOrder.DescendingOrder)
+
+    def test_harmonics_vertical_splitter_expands_candidates_without_changing_analysis(self) -> None:
+        self.harmonic_frame()
+        self.window._open_harmonics()
+        self.window.resize(1360, 1000)
+        assert self.application is not None
+        self.application.processEvents()
+        page = self.window.harmonics_page
+        panel = self.window.harmonic_dialog
+        item = panel.table.item(0, 0)
+        assert item is not None
+        item.setCheckState(Qt.CheckState.Checked)
+        stream = self.window.capture.stream
+        snapshot = page._display
+        candidates = panel.candidates
+        selected = panel.selected_fundamentals()
+        splitter = page.analysis_splitter
+        self.assertEqual(splitter.orientation(), Qt.Orientation.Vertical)
+        self.assertIs(splitter.widget(0), page.spectrum)
+        self.assertIs(splitter.widget(1), page.tables_splitter)
+        self.assertFalse(splitter.childrenCollapsible())
+        self.assertGreaterEqual(splitter.handleWidth(), 7)
+        before = panel.table.viewport().height()
+        total = sum(splitter.sizes())
+        splitter.setSizes([page.spectrum.minimumHeight(), total - page.spectrum.minimumHeight()])
+        self.application.processEvents()
+        self.assertGreater(panel.table.viewport().height(), before)
+        self.assertGreaterEqual(splitter.sizes()[0], page.spectrum.minimumHeight())
+        sizes = splitter.sizes()
+        self.window.view_tabs.setCurrentIndex(0)
+        self.window.view_tabs.setCurrentIndex(2)
+        self.application.processEvents()
+        self.assertEqual(splitter.sizes(), sizes)
+        self.assertIs(self.window.capture.stream, stream)
+        self.assertIs(page._display, snapshot)
+        self.assertEqual(panel.candidates, candidates)
+        self.assertEqual(panel.selected_fundamentals(), selected)
+        self.window.resize(860, 560)
+        self.application.processEvents()
+        self.assertEqual(page.tables_splitter.orientation(), Qt.Orientation.Vertical)
+        self.assertGreaterEqual(page.body_content.minimumHeight(), page.body_layout.minimumSize().height())
+        self.assertGreaterEqual(splitter.sizes()[0], page.spectrum.minimumHeight())
+        self.assertGreaterEqual(splitter.sizes()[1], page.tables_splitter.minimumSizeHint().height())
+        self.assertGreater(page.body_scroll.verticalScrollBar().maximum(), 0)
+
+    def test_harmonics_tab_embeds_candidates_without_restarting_capture(self) -> None:
+        self.harmonic_frame()
+        stream = self.window.capture.stream
+        buffer = self.window.capture.buffer
+        self.assertEqual([self.window.view_tabs.tabText(index) for index in range(self.window.view_tabs.count())], ["Spectrum", "Waterfall", "Harmonics"])
+        self.window._open_harmonics()
+        dialog = self.window.harmonic_dialog
+        self.assertEqual(self.window.view_tabs.currentIndex(), 2)
+        self.assertIs(self.window.view_stack.currentWidget(), self.window.harmonics_page)
+        self.assertTrue(dialog.isVisible())
+        self.assertFalse(dialog.isWindow())
+        self.assertFalse(self.window.spectra.isVisible())
+        candidates = dialog.candidates
+        item = dialog.table.item(0, 0)
+        assert item is not None
+        item.setCheckState(Qt.CheckState.Checked)
+        selected = dialog.selected_fundamentals()
+        for index in (0, 1, 2):
+            self.window.view_tabs.setCurrentIndex(index)
+            self.assertIs(self.window.capture.stream, stream)
+            self.assertIs(self.window.capture.buffer, buffer)
+            self.assertEqual(dialog.candidates, candidates)
+            self.assertEqual(dialog.selected_fundamentals(), selected)
+
+    def test_harmonics_page_freezes_one_analysis_snapshot_without_stopping_capture(self) -> None:
+        samples = self.harmonic_frame()
+        self.window._open_harmonics()
+        page = self.window.harmonics_page
+        panel = self.window.harmonic_dialog
+        panel.candidate_activated.emit(0)
+        self.assertAlmostEqual(page.base_frequency.value(), 100.3, delta=0.1)
+        self.assertEqual(page.details.rowCount(), 4)
+
+        def second_level() -> str:
+            item = page.details.item(1, 2)
+            assert item is not None
+            return item.text()
+
+        frozen_curve = page.spectrum.curves[0].getData()[1].copy()
+        assert page._display is not None
+        frozen_snapshot = page._display[1].copy()
+        frozen_level = second_level()
+        panel.auto_checkbox.setChecked(True)
+        self.assertTrue(panel.auto_timer.isActive())
+        page.freeze_button.setChecked(True)
+        self.assertFalse(panel.auto_timer.isActive())
+        stream = self.window.capture.stream
+        assert isinstance(stream, FakeStream)
+        stream.callback(samples * 0.1, len(samples), None, "")
+        self.window._update_measurement()
+        self.assertIs(self.window.capture.stream, stream)
+        np.testing.assert_array_equal(page._display[1], frozen_snapshot)
+        np.testing.assert_array_equal(page.spectrum.curves[0].getData()[1], frozen_curve)
+        self.assertEqual(second_level(), frozen_level)
+        self.assertFalse(np.array_equal(self.window.spectra.curves[0].getData()[1], frozen_curve))
+        panel.identify_button.click()
+        self.assertEqual(second_level(), frozen_level)
+        page.freeze_button.setChecked(False)
+        self.assertTrue(panel.auto_timer.isActive())
+        self.assertFalse(np.array_equal(page._display[1], frozen_snapshot))
+        self.assertAlmostEqual(float(second_level()), float(frozen_level) - 20, delta=0.2)
+
+    def test_harmonics_page_locks_base_during_candidate_updates_and_manual_edits(self) -> None:
+        self.harmonic_frame()
+        self.window._open_harmonics()
+        page = self.window.harmonics_page
+        panel = self.window.harmonic_dialog
+        panel.candidate_activated.emit(0)
+        channel, original = panel.candidates[0]
+        updated = justfan.FundamentalCandidate(original.frequency + 0.4, original.harmonics, original.score)
+        page.lock_checkbox.setChecked(True)
+        panel.merge_candidates(((channel, updated),), 48000 / 32768)
+        self.assertAlmostEqual(page.base_frequency.value(), original.frequency, delta=0.01)
+        page.lock_checkbox.setChecked(False)
+        self.assertAlmostEqual(page.base_frequency.value(), updated.frequency, delta=0.01)
+        page.base_frequency.setValue(125)
+        page.base_frequency.editingFinished.emit()
+        self.assertTrue(page.lock_checkbox.isChecked())
+        item = panel.table.item(0, 0)
+        assert item is not None
+        item.setCheckState(Qt.CheckState.Checked)
+        panel.merge_candidates(((channel, updated),), 48000 / 32768)
+        self.assertEqual(page.base_frequency.value(), 125)
+
+    def test_harmonics_page_omits_relative_readings_when_h1_is_absent_and_links_orders(self) -> None:
+        samples = self.harmonic_frame()
+        self.window.harmonic_dialog.clear_candidates()
+        time = np.arange(len(samples)) / 48000
+        samples[:, 0] = sum(amplitude * np.sin(2 * np.pi * frequency * time) for frequency, amplitude in ((200.6, 0.4), (300.9, 0.25), (401.2, 0.15)))
+        samples[:, 1] = 0
+        stream = self.window.capture.stream
+        assert isinstance(stream, FakeStream)
+        stream.callback(samples, len(samples), None, "")
+        self.window._update_measurement()
+        self.window._open_harmonics()
+        panel = self.window.harmonic_dialog
+        index = next(index for index, (channel, candidate) in enumerate(panel.candidates) if channel == 0 and candidate.inferred and abs(candidate.frequency - 100.3) < 0.5)
+        panel.candidate_activated.emit(index)
+        page = self.window.harmonics_page
+        self.assertEqual([peak.order for peak in page._harmonics], [2, 3, 4])
+        for row in range(page.details.rowCount()):
+            item = page.details.item(row, 3)
+            assert item is not None
+            self.assertEqual(item.text(), "-")
+        self.assertIn("H1 absent", page.analysis_status.text())
+        page._order_clicked(1, 0)
+        assert page._cursor is not None
+        self.assertAlmostEqual(page._cursor.pos().x(), page._harmonics[1].frequency)
+        view = page.spectrum.plots[0].getViewBox()
+        peak = page._harmonics[2]
+        position = view.mapViewToScene(justfan.pg.Point(peak.frequency, peak.level))
+        page._plot_clicked(SimpleNamespace(scenePos=lambda: position, button=lambda: Qt.MouseButton.LeftButton))
+        self.assertEqual(page.details.currentRow(), 2)
+        self.assertAlmostEqual(page._cursor.pos().x(), peak.frequency)
+
+    def test_harmonics_page_keeps_zoom_independent_and_spectrum_markers_optional(self) -> None:
+        self.harmonic_frame()
+        source = self.window.spectra
+        source.plots[0].getViewBox().setRange(xRange=(200, 400), yRange=(-90, -10), padding=0)
+        self.window._open_harmonics()
+        page = self.window.harmonics_page
+        panel = self.window.harmonic_dialog
+        item = panel.table.item(0, 0)
+        assert item is not None
+        item.setCheckState(Qt.CheckState.Checked)
+        page.spectrum.plots[0].getViewBox().setRange(xRange=(500, 700), yRange=(-70, -20), padding=0)
+        self.window.frequency_maximum.setValue(2000)
+        self.assertEqual(page.spectrum.frequency_range, (0, 2000))
+        self.assertEqual(source.frequency_range, (0, 10000))
+        self.window.view_tabs.setCurrentIndex(0)
+        self.assertEqual(self.window.frequency_maximum.value(), 10000)
+        self.assertEqual(source.plots[0].getViewBox().viewRange(), [[200, 400], [-90, -10]])
+        self.assertTrue(source.harmonic_markers[0]["H1"].isVisible())
+        self.window.harmonic_overlay_button.setChecked(False)
+        self.assertTrue(all(not marker.isVisible() for markers in source.harmonic_markers for marker in markers.values()))
+        self.window.view_tabs.setCurrentIndex(2)
+        self.assertEqual(self.window.frequency_maximum.value(), 2000)
+        self.assertEqual(page.spectrum.plots[0].getViewBox().viewRange()[1], [-70, -20])
+        self.assertTrue(page.spectrum.harmonic_markers[0]["H1"].isVisible())
+        self.window.reset_zoom_button.click()
+        self.assertEqual(page.spectrum.plots[0].getViewBox().viewRange(), [[0, 2000], [justfan.DB_FLOOR - 5, 0]])
+        self.assertEqual(source.plots[0].getViewBox().viewRange(), [[200, 400], [-90, -10]])
+
+    def test_harmonics_page_discards_frozen_data_and_manual_base_on_restart(self) -> None:
+        self.harmonic_frame()
+        self.window._open_harmonics()
+        page = self.window.harmonics_page
+        page.base_frequency.setValue(100.3)
+        page.base_frequency.editingFinished.emit()
+        page.freeze_button.setChecked(True)
+        self.window.start_capture()
+        self.assertIsNone(page._display)
+        self.assertIsNone(page._latest)
+        self.assertEqual(page.base_frequency.value(), 0)
+        self.assertFalse(page.freeze_button.isChecked())
+        self.assertFalse(page.freeze_button.isEnabled())
+        self.assertFalse(page.lock_checkbox.isChecked())
+        self.assertEqual(page.details.rowCount(), 0)
+        self.assertEqual(self.window.harmonic_dialog.candidates, ())
+
+    def test_harmonic_device_change_does_not_reuse_previous_audio(self) -> None:
+        self.harmonic_frame()
+        self.window._open_harmonics()
+        self.assertTrue(self.window.harmonic_dialog.candidates)
+        self.window.device_combo.setCurrentIndex(self.window.device_combo.findData(self.devices[1]))
+        self.assertEqual(self.window.harmonic_dialog.candidates, ())
+        self.assertFalse(self.window.harmonics_button.isEnabled())
+        self.window._identify_fundamentals()
+        self.assertEqual(self.window.harmonic_dialog.candidates, ())
 
     def test_spectrum_defaults_to_frequency_range_up_to_10_khz(self) -> None:
         self.assertEqual(self.window.spectra.plots[0].getViewBox().viewRange()[0], [0, 10_000])
