@@ -10,6 +10,8 @@ The NOISE is the top priority:
 
 The JustFan aims to help monitor, control, and calibrate your PC’s cooling system.
 
+[Usage guide](Usage.md)
+
 ## Features
 
 ### Implemented
@@ -21,19 +23,9 @@ The JustFan aims to help monitor, control, and calibrate your PC’s cooling sys
 - Fan speed control with thermal feedback
 - Automatic thermal calibration
 
-## Screenshots
-
-### Spectrum
+## Screenshot
 
 ![Spectrum view](images/Spectrum.png)
-
-### Waterfall
-
-![Waterfall view](images/Waterfall.png)
-
-### Harmonics
-
-![Waterfall view](images/Harmonics.png)
 
 ## Requirements
 
