@@ -31,6 +31,10 @@ The JustFan aims to help monitor, control, and calibrate your PC’s cooling sys
 
 ![Waterfall view](images/Waterfall.png)
 
+### Harmonics
+
+![Waterfall view](images/Harmonics.png)
+
 ## Requirements
 
 - Python 3.10 or newer
